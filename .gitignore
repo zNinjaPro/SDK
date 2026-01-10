@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+.env
+.env.local
+coverage/
+.nyc_output/
+*.tsbuildinfo
+.vscode/
+.idea/
+
+# Test artifacts
+test-ledger/
+test-fixtures/
+
+# Circuit artifacts (large files - download separately)
+circuits/*.zkey
+circuits/*.wasm
+circuits/*.r1cs
+circuits/*.sym
+
+# Local wallet files
+wallet.json
+*.pem
