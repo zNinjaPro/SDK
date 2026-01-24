@@ -1,9 +1,21 @@
 /**
- * Note (UTXO) management for shielded pool
+ * Epoch-aware Note (UTXO) management for shielded pool
+ *
+ * Features:
+ * - Tracks notes by epoch for expiration management
+ * - Provides epoch-segmented balance calculations
+ * - Detects notes needing renewal before expiration
+ * - Computes epoch-aware nullifiers (4 inputs)
  */
 
 import { PublicKey } from "@solana/web3.js";
-import { Note, SpendingKeys } from "./types";
+import {
+  Note,
+  SpendingKeys,
+  BalanceInfo,
+  EpochInfo,
+  EpochState,
+} from "./types";
 import {
   computeCommitment,
   computeNullifier,
@@ -13,17 +25,41 @@ import {
   encryptNote,
   decryptNote,
 } from "./crypto";
+import { EPOCH_TIMING } from "./config";
 
 /**
- * Manages note collection, selection, and balance tracking
+ * Warning threshold for expiring notes (2 epochs before expiration)
+ */
+const RENEWAL_WARNING_EPOCHS = 2n;
+
+/**
+ * Manages note collection with epoch awareness, selection, and balance tracking
  */
 export class NoteManager {
   private notes: Note[] = [];
   private pendingNotes: Note[] = [];
   private spendingKeys?: SpendingKeys;
+  private currentEpoch: bigint = 0n;
+  private epochExpirySlots: bigint;
 
-  constructor(spendingKeys?: SpendingKeys) {
+  constructor(spendingKeys?: SpendingKeys, epochExpirySlots?: bigint) {
     this.spendingKeys = spendingKeys;
+    this.epochExpirySlots =
+      epochExpirySlots ?? EPOCH_TIMING.DEFAULT_EXPIRY_SLOTS;
+  }
+
+  /**
+   * Update the current epoch (called when syncing with chain)
+   */
+  setCurrentEpoch(epoch: bigint): void {
+    this.currentEpoch = epoch;
+  }
+
+  /**
+   * Get the current epoch
+   */
+  getCurrentEpoch(): bigint {
+    return this.currentEpoch;
   }
 
   /**
@@ -31,9 +67,13 @@ export class NoteManager {
    */
   addNote(note: Note): void {
     const existing = this.notes.find((n) =>
-      arraysEqual(n.commitment, note.commitment)
+      arraysEqual(n.commitment, note.commitment),
     );
     if (existing) {
+      // Update epoch and leafIndex if not set
+      if (existing.epoch === undefined && note.epoch !== undefined) {
+        existing.epoch = note.epoch;
+      }
       if (existing.leafIndex === undefined && note.leafIndex !== undefined) {
         existing.leafIndex = note.leafIndex;
       }
@@ -43,7 +83,7 @@ export class NoteManager {
     this.notes.push(note);
     // Remove from pending if it exists
     this.pendingNotes = this.pendingNotes.filter(
-      (n) => !arraysEqual(n.commitment, note.commitment)
+      (n) => !arraysEqual(n.commitment, note.commitment),
     );
   }
 
@@ -81,6 +121,43 @@ export class NoteManager {
   }
 
   /**
+   * Get notes by epoch
+   */
+  getNotesByEpoch(epoch: bigint): Note[] {
+    return this.notes.filter((n) => !n.spent && n.epoch === epoch);
+  }
+
+  /**
+   * Get notes that are expiring (within warning threshold)
+   */
+  getExpiringNotes(): Note[] {
+    const expiryThreshold = this.currentEpoch + RENEWAL_WARNING_EPOCHS;
+    return this.notes.filter((n) => {
+      if (n.spent) return false;
+      const noteEpoch = n.epoch ?? 0n;
+      // Note expires if its epoch + expiry period is approaching
+      return noteEpoch <= expiryThreshold && noteEpoch < this.currentEpoch;
+    });
+  }
+
+  /**
+   * Get notes that have expired and cannot be spent
+   */
+  getExpiredNotes(): Note[] {
+    // Calculate how many epochs back is considered expired
+    // (expiry is measured in slots, but we check epoch numbers)
+    const expiryEpochs =
+      this.epochExpirySlots / EPOCH_TIMING.DEFAULT_DURATION_SLOTS;
+    const expiredBefore = this.currentEpoch - expiryEpochs;
+
+    return this.notes.filter((n) => {
+      if (n.spent) return false;
+      const noteEpoch = n.epoch ?? 0n;
+      return noteEpoch < expiredBefore;
+    });
+  }
+
+  /**
    * Mark a note as spent by commitment
    */
   markSpent(commitment: Uint8Array): void {
@@ -93,14 +170,18 @@ export class NoteManager {
   }
 
   /**
-   * Mark notes as spent by nullifier
+   * Mark notes as spent by nullifier (epoch-aware)
    */
-  markSpentByNullifier(nullifier: Buffer | Uint8Array): void {
+  markSpentByNullifier(nullifier: Buffer | Uint8Array, epoch?: bigint): void {
     if (!this.spendingKeys) return;
 
     const nullifierArray = new Uint8Array(nullifier);
     for (const note of this.notes) {
       if (note.spent) continue;
+
+      // If epoch is specified, only check notes from that epoch
+      if (epoch !== undefined && note.epoch !== epoch) continue;
+
       if (arraysEqual(note.nullifier, nullifierArray)) {
         note.spent = true;
         break;
@@ -109,45 +190,72 @@ export class NoteManager {
   }
 
   /**
-   * Create a new note with the given parameters
+   * Create a new note with the given parameters (epoch-aware)
+   * Note: epoch and leafIndex will be set when the note is confirmed on-chain
    */
-  async createNote(value: bigint, owner: Uint8Array): Promise<Note> {
+  async createNote(
+    value: bigint,
+    owner: Uint8Array,
+    token?: PublicKey,
+  ): Promise<Note> {
     const randomness = randomBytes(32);
     console.log(
       "🔨 Creating note: value=",
       value.toString(),
       ", owner_len=",
-      owner.length
+      owner.length,
     );
     const commitment = await computeCommitment(value, owner, randomness);
     console.log("🔨 Commitment computed, length=", commitment.length);
     console.log(
       "🔨 Commitment (hex):",
-      Buffer.from(commitment).toString("hex").slice(0, 64)
+      Buffer.from(commitment).toString("hex").slice(0, 64),
     );
 
-    let nullifier: any = new Uint8Array(32);
+    // Note: Nullifier will be recomputed with epoch and leafIndex once confirmed
+    // For now, compute a placeholder with current epoch and index 0
+    let nullifier: Uint8Array = new Uint8Array(32);
     if (this.spendingKeys) {
       nullifier = await computeNullifier(
         commitment,
-        this.spendingKeys.nullifierKey
+        this.spendingKeys.nullifierKey,
+        this.currentEpoch,
+        0, // placeholder until confirmed
       );
     }
 
     return {
       value,
-      token: PublicKey.default, // Will be set when deposited
+      token: token ?? PublicKey.default,
       owner,
       blinding: randomness,
       randomness,
       commitment,
       nullifier,
       spent: false,
+      epoch: this.currentEpoch, // tentative, updated on confirmation
+      leafIndex: undefined, // set on confirmation
     };
   }
 
   /**
+   * Recompute nullifier for a note after confirmation (with real epoch/leafIndex)
+   */
+  async recomputeNullifier(note: Note): Promise<void> {
+    if (!this.spendingKeys) return;
+    if (note.epoch === undefined || note.leafIndex === undefined) return;
+
+    note.nullifier = await computeNullifier(
+      note.commitment,
+      this.spendingKeys.nullifierKey,
+      note.epoch,
+      note.leafIndex,
+    );
+  }
+
+  /**
    * Select notes for spending (greedy algorithm)
+   * Prioritizes notes from older epochs to encourage renewal
    */
   selectNotes(amount: bigint, minNotes: number = 1): Note[] {
     if (minNotes < 1) {
@@ -163,7 +271,12 @@ export class NoteManager {
         seenCommitments.add(key);
         return true;
       })
-      .sort((a, b) => Number(b.value - a.value));
+      // Sort by epoch ascending (older first), then by value descending
+      .sort((a, b) => {
+        const epochDiff = Number((a.epoch ?? 0n) - (b.epoch ?? 0n));
+        if (epochDiff !== 0) return epochDiff;
+        return Number(b.value - a.value);
+      });
 
     const selected: Note[] = [];
     let sum = 0n;
@@ -181,8 +294,18 @@ export class NoteManager {
     }
 
     throw new Error(
-      `Insufficient note count: need at least ${minNotes}, have ${selected.length}`
+      `Insufficient note count: need at least ${minNotes}, have ${selected.length}`,
     );
+  }
+
+  /**
+   * Select notes specifically for renewal (oldest epochs first)
+   */
+  selectNotesForRenewal(maxNotes: number = 10): Note[] {
+    const expiringNotes = this.getExpiringNotes();
+    return expiringNotes
+      .sort((a, b) => Number((a.epoch ?? 0n) - (b.epoch ?? 0n)))
+      .slice(0, maxNotes);
   }
 
   /**
@@ -194,15 +317,62 @@ export class NoteManager {
       .reduce((sum, note) => sum + note.value, 0n);
   }
 
+  /**
+   * Calculate detailed balance breakdown by epoch status
+   */
+  calculateBalanceInfo(): BalanceInfo {
+    const unspent = this.notes.filter((n) => !n.spent);
+    const expiredNotes = this.getExpiredNotes();
+    const expiringNotes = this.getExpiringNotes();
+
+    // Spendable = current epoch + recent epochs (not expiring/expired)
+    const expiredSet = new Set(
+      expiredNotes.map((n) => Buffer.from(n.commitment).toString("hex")),
+    );
+    const expiringSet = new Set(
+      expiringNotes.map((n) => Buffer.from(n.commitment).toString("hex")),
+    );
+
+    let spendable = 0n;
+    let pending = this.calculatePendingBalance();
+    let expiring = 0n;
+    let expired = 0n;
+
+    for (const note of unspent) {
+      const key = Buffer.from(note.commitment).toString("hex");
+      if (expiredSet.has(key)) {
+        expired += note.value;
+      } else if (expiringSet.has(key)) {
+        expiring += note.value;
+      } else {
+        spendable += note.value;
+      }
+    }
+
+    const total = spendable + pending + expiring;
+
+    return {
+      total,
+      spendable,
+      pending,
+      expiring,
+      expired,
+      noteCount: unspent.length,
+      expiringNoteCount: expiringNotes.length,
+      expiredNoteCount: expiredNotes.length,
+    };
+  }
+
   // Static utility methods below
   /**
-   * Create a new note
+   * Create a new note (static version, epoch set on confirmation)
    */
   static async createNote(
     value: bigint,
     token: PublicKey,
     owner: Uint8Array,
-    memo?: string
+    memo?: string,
+    epoch?: bigint,
   ): Promise<Note> {
     const blinding = randomBytes(32);
     const randomness = randomBytes(32);
@@ -217,8 +387,10 @@ export class NoteManager {
       randomness,
       memo,
       commitment,
-      nullifier: new Uint8Array(32) as any, // Will be computed with nullifier key
+      nullifier: new Uint8Array(32), // Will be computed with nullifier key + epoch + leafIndex
       spent: false,
+      epoch, // tentative
+      leafIndex: undefined,
     };
   }
 
@@ -230,15 +402,17 @@ export class NoteManager {
   }
 
   /**
-   * Compute nullifier for a note
+   * Compute nullifier for a note (epoch-aware, 4 inputs)
    */
   static async computeNullifier(
     note: Note,
-    nullifierKey: Uint8Array
+    nullifierKey: Uint8Array,
   ): Promise<Uint8Array> {
     const commitment =
       note.commitment || (await NoteManager.computeCommitment(note));
-    return await computeNullifier(commitment, nullifierKey);
+    const epoch = note.epoch ?? 0n;
+    const leafIndex = note.leafIndex ?? 0;
+    return await computeNullifier(commitment, nullifierKey, epoch, leafIndex);
   }
 
   /**
@@ -250,7 +424,7 @@ export class NoteManager {
       note.token.toBytes(),
       note.owner,
       note.blinding,
-      note.memo
+      note.memo,
     );
 
     const { encrypted, nonce } = encryptNote(serialized, viewingKey);
@@ -266,7 +440,8 @@ export class NoteManager {
     encryptedData: Uint8Array,
     viewingKey: Uint8Array,
     token: PublicKey,
-    leafIndex?: number
+    leafIndex?: number,
+    epoch?: bigint,
   ): Promise<Note | null> {
     if (encryptedData.length < 24) {
       return null;
@@ -307,8 +482,9 @@ export class NoteManager {
         randomness,
         memo,
         commitment,
-        nullifier: new Uint8Array(32), // Will be computed with nullifier key
+        nullifier: new Uint8Array(32), // Will be computed with nullifier key + epoch + leafIndex
         leafIndex,
+        epoch,
         spent: false,
       };
     } catch {
@@ -339,7 +515,7 @@ export class NoteManager {
   static selectNotes(
     notes: Note[],
     amount: bigint,
-    minNotes: number = 1
+    minNotes: number = 1,
   ): Note[] {
     if (minNotes < 1) {
       throw new Error("minNotes must be at least 1");
@@ -372,7 +548,7 @@ export class NoteManager {
     }
 
     throw new Error(
-      `Insufficient note count: need at least ${minNotes}, have ${selected.length}`
+      `Insufficient note count: need at least ${minNotes}, have ${selected.length}`,
     );
   }
 
@@ -386,22 +562,25 @@ export class NoteManager {
   }
 
   /**
-   * Mark notes as spent based on nullifier set
+   * Mark notes as spent based on nullifier set (epoch-aware)
    */
   static async markSpent(
     notes: Note[],
-    spentNullifiers: Uint8Array[],
-    nullifierKey: Uint8Array
+    spentNullifiers: Array<{ nullifier: Uint8Array; epoch?: bigint }>,
+    nullifierKey: Uint8Array,
   ): Promise<void> {
     for (const note of notes) {
       if (note.spent) continue;
 
       const nullifier = await NoteManager.computeNullifier(note, nullifierKey);
 
-      for (const spentNullifier of spentNullifiers) {
-        if (arraysEqual(nullifier, spentNullifier)) {
-          note.spent = true;
-          break;
+      for (const spent of spentNullifiers) {
+        // Match nullifier and optionally epoch
+        if (arraysEqual(nullifier, spent.nullifier)) {
+          if (spent.epoch === undefined || spent.epoch === note.epoch) {
+            note.spent = true;
+            break;
+          }
         }
       }
     }

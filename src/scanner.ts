@@ -1,13 +1,26 @@
 /**
- * UTXOScanner - Scans chain for relevant events and updates note state
+ * UTXOScanner - Epoch-aware scanning for chain events and note state updates
+ *
+ * Scans for:
+ * - DepositEvent (with epoch info)
+ * - WithdrawEvent (with nullifier tracking)
+ * - TransferEvent (with epoch-scoped nullifiers and outputs)
+ * - RenewEvent (epoch migration)
+ * - EpochRolloverEvent
+ * - EpochFinalizedEvent
  */
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import { Program } from "@coral-xyz/anchor";
 import { NoteManager } from "./noteManager";
-import { Note } from "./types";
+import { Note, EpochState } from "./types";
 import { decryptNote } from "./crypto";
 import crypto from "crypto";
+
+/**
+ * Callback for epoch state changes
+ */
+export type EpochCallback = (epoch: bigint, state: EpochState) => void;
 
 export class UTXOScanner {
   private connection: Connection;
@@ -17,11 +30,17 @@ export class UTXOScanner {
   private subscriptionId?: number;
   private viewingKey?: Uint8Array;
   private noteManager?: NoteManager;
+  private epochCallbacks: EpochCallback[] = [];
 
   constructor(connection: Connection, program: Program, poolConfig: PublicKey) {
     this.connection = connection;
     this.program = program;
     this.poolConfig = poolConfig;
+  }
+
+  /** Register a callback for epoch state changes */
+  onEpochChange(callback: EpochCallback): void {
+    this.epochCallbacks.push(callback);
   }
 
   /** Rescan a specific confirmed transaction by signature (used to promote pending notes emitted in same tx) */
@@ -41,17 +60,50 @@ export class UTXOScanner {
   }
 
   // Anchor event discriminators: sha256("event:Name").slice(0,8)
+  // V2 epoch-aware events
   private static DEPOSIT_EVENT_DISCRIMINATOR = crypto
     .createHash("sha256")
-    .update("event:DepositEventV1")
+    .update("event:DepositEvent")
     .digest()
     .subarray(0, 8);
   private static WITHDRAW_EVENT_DISCRIMINATOR = crypto
     .createHash("sha256")
-    .update("event:WithdrawEventV1")
+    .update("event:WithdrawEvent")
     .digest()
     .subarray(0, 8);
   private static TRANSFER_EVENT_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:TransferEvent")
+    .digest()
+    .subarray(0, 8);
+  private static RENEW_EVENT_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:RenewEvent")
+    .digest()
+    .subarray(0, 8);
+  private static EPOCH_ROLLOVER_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:EpochRolloverEvent")
+    .digest()
+    .subarray(0, 8);
+  private static EPOCH_FINALIZED_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:EpochFinalizedEvent")
+    .digest()
+    .subarray(0, 8);
+
+  // Legacy V1 events for backwards compatibility during migration
+  private static DEPOSIT_V1_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:DepositEventV1")
+    .digest()
+    .subarray(0, 8);
+  private static WITHDRAW_V1_DISCRIMINATOR = crypto
+    .createHash("sha256")
+    .update("event:WithdrawEventV1")
+    .digest()
+    .subarray(0, 8);
+  private static TRANSFER_V1_DISCRIMINATOR = crypto
     .createHash("sha256")
     .update("event:ShieldedTransferEventV1")
     .digest()
@@ -75,7 +127,7 @@ export class UTXOScanner {
       async (logs) => {
         await this.processLogs(logs);
       },
-      "confirmed"
+      "confirmed",
     );
 
     // Scan historical events in background (don't await)
@@ -104,7 +156,7 @@ export class UTXOScanner {
     // Get recent transactions for this pool
     const signatures = await this.connection.getSignaturesForAddress(
       this.poolConfig,
-      { limit: 100 }
+      { limit: 100 },
     );
 
     for (const sig of signatures) {
@@ -150,14 +202,42 @@ export class UTXOScanner {
       }
       if (eventData.length < 8) continue;
       const discriminator = eventData.subarray(0, 8);
+
+      // V2 epoch-aware events
       if (arraysEqual(discriminator, UTXOScanner.DEPOSIT_EVENT_DISCRIMINATOR)) {
-        await this.handleDepositEvent(eventData);
+        await this.handleDepositEventV2(eventData);
       } else if (
         arraysEqual(discriminator, UTXOScanner.WITHDRAW_EVENT_DISCRIMINATOR)
       ) {
-        await this.handleWithdrawEvent(eventData);
+        await this.handleWithdrawEventV2(eventData);
       } else if (
         arraysEqual(discriminator, UTXOScanner.TRANSFER_EVENT_DISCRIMINATOR)
+      ) {
+        await this.handleTransferEventV2(eventData);
+      } else if (
+        arraysEqual(discriminator, UTXOScanner.RENEW_EVENT_DISCRIMINATOR)
+      ) {
+        await this.handleRenewEvent(eventData);
+      } else if (
+        arraysEqual(discriminator, UTXOScanner.EPOCH_ROLLOVER_DISCRIMINATOR)
+      ) {
+        await this.handleEpochRolloverEvent(eventData);
+      } else if (
+        arraysEqual(discriminator, UTXOScanner.EPOCH_FINALIZED_DISCRIMINATOR)
+      ) {
+        await this.handleEpochFinalizedEvent(eventData);
+      }
+      // Legacy V1 events (for historical data)
+      else if (
+        arraysEqual(discriminator, UTXOScanner.DEPOSIT_V1_DISCRIMINATOR)
+      ) {
+        await this.handleDepositEvent(eventData);
+      } else if (
+        arraysEqual(discriminator, UTXOScanner.WITHDRAW_V1_DISCRIMINATOR)
+      ) {
+        await this.handleWithdrawEvent(eventData);
+      } else if (
+        arraysEqual(discriminator, UTXOScanner.TRANSFER_V1_DISCRIMINATOR)
       ) {
         await this.handleTransferEvent(eventData);
       }
@@ -177,7 +257,7 @@ export class UTXOScanner {
     const commitment = data.subarray(cmOffset, cmOffset + 32);
     console.log(
       "🔍 Scanner: Extracted commitment from event, length:",
-      commitment.length
+      commitment.length,
     );
     const leafIndexOffset = cmOffset + 32;
     const leafIndexLE = data.subarray(leafIndexOffset, leafIndexOffset + 8);
@@ -200,11 +280,11 @@ export class UTXOScanner {
       if (pending.length > 0) {
         console.log(
           "   Pending[0] commitment length:",
-          pending[0].commitment.length
+          pending[0].commitment.length,
         );
       }
       const idx = pending.findIndex((n) =>
-        arraysEqual(n.commitment, commitment)
+        arraysEqual(n.commitment, commitment),
       );
       if (idx !== -1) {
         console.log("✅ Scanner: Found matching pending note at index", idx);
@@ -215,7 +295,7 @@ export class UTXOScanner {
       }
       // No matching pending note; leave pending untouched to avoid corrupting leafIndex/commitment mapping
       console.log(
-        "⚠️ Scanner: No matching commitment; leaving pending notes unchanged"
+        "⚠️ Scanner: No matching commitment; leaving pending notes unchanged",
       );
       return;
     }
@@ -304,12 +384,312 @@ export class UTXOScanner {
     }
   }
 
+  // ============================================================
+  // V2 EPOCH-AWARE EVENT HANDLERS
+  // ============================================================
+
+  /**
+   * Handle V2 deposit events with epoch information
+   * Layout: discriminator(8) | epoch(u64) | pool_id(32) | cm(32) | leaf_index(u64) | new_root(32) | enc_note(Vec<u8>)
+   */
+  private async handleDepositEventV2(data: Buffer): Promise<void> {
+    if (!this.noteManager) return;
+
+    const minimum = 8 + 8 + 32 + 32 + 8 + 32 + 4; // discriminator + epoch + pool + cm + idx + root + vec_len
+    if (data.length < minimum) return;
+
+    let cursor = 8; // skip discriminator
+
+    // Extract epoch
+    const epoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+
+    // Skip pool_id
+    cursor += 32;
+
+    // Extract commitment
+    const commitment = data.subarray(cursor, cursor + 32);
+    cursor += 32;
+
+    // Extract leaf index
+    const leafIndex = Number(data.readBigUInt64LE(cursor));
+    cursor += 8;
+
+    // Skip new_root
+    cursor += 32;
+
+    // Extract encrypted note
+    if (data.length < cursor + 4) return;
+    const encLen = data.readUInt32LE(cursor);
+    cursor += 4;
+    if (data.length < cursor + encLen) return;
+    const encryptedNote = data.subarray(cursor, cursor + encLen);
+
+    console.log(
+      `🔍 Scanner: V2 Deposit - epoch=${epoch}, leafIndex=${leafIndex}`,
+    );
+
+    // Promote pending note matching commitment
+    const pending = (this.noteManager as any).pendingNotes as
+      | Note[]
+      | undefined;
+    if (pending) {
+      const idx = pending.findIndex((n) =>
+        arraysEqual(n.commitment, commitment),
+      );
+      if (idx !== -1) {
+        console.log("✅ Scanner: Found matching pending note");
+        const note = pending[idx];
+        note.epoch = epoch;
+        note.leafIndex = leafIndex;
+        this.noteManager.addNote(note);
+        return;
+      }
+    }
+
+    // Attempt decryption fallback
+    if (this.viewingKey) {
+      const decrypted = await this.tryDecryptNote(commitment, encryptedNote);
+      if (decrypted) {
+        decrypted.epoch = epoch;
+        decrypted.leafIndex = leafIndex;
+        this.noteManager.addNote(decrypted);
+      }
+    }
+  }
+
+  /**
+   * Handle V2 withdraw events with epoch-scoped nullifiers
+   * Layout: discriminator(8) | epoch(u64) | pool_id(32) | nullifier(32) | amount(u64) | recipient(32)
+   */
+  private async handleWithdrawEventV2(data: Buffer): Promise<void> {
+    if (!this.noteManager) return;
+
+    const minimum = 8 + 8 + 32 + 32 + 8 + 32;
+    if (data.length < minimum) return;
+
+    let cursor = 8; // skip discriminator
+
+    const epoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+
+    // Skip pool_id
+    cursor += 32;
+
+    // Extract nullifier
+    const nullifier = data.subarray(cursor, cursor + 32);
+
+    console.log(`🔍 Scanner: V2 Withdraw - epoch=${epoch}`);
+    this.noteManager.markSpentByNullifier(nullifier, epoch);
+  }
+
+  /**
+   * Handle V2 transfer events with epoch-scoped nullifiers and outputs
+   * Layout: discriminator(8) | output_epoch(u64) | pool_id(32) | nullifiers(Vec<[u8;32]>) |
+   *         input_epochs(Vec<u64>) | commitments(Vec<[u8;32]>) | leaf_indices(Vec<u64>)
+   */
+  private async handleTransferEventV2(data: Buffer): Promise<void> {
+    if (!this.noteManager) return;
+
+    const minimum = 8 + 8 + 32 + 4; // discriminator + output_epoch + pool + vec_len
+    if (data.length < minimum) return;
+
+    let cursor = 8; // skip discriminator
+
+    const outputEpoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+
+    // Skip pool_id
+    cursor += 32;
+
+    // Read nullifiers vector
+    if (data.length < cursor + 4) return;
+    const nfLen = data.readUInt32LE(cursor);
+    cursor += 4;
+
+    const nullifiers: Uint8Array[] = [];
+    for (let i = 0; i < nfLen; i++) {
+      if (cursor + 32 > data.length) return;
+      nullifiers.push(new Uint8Array(data.subarray(cursor, cursor + 32)));
+      cursor += 32;
+    }
+
+    // Read input epochs vector
+    if (data.length < cursor + 4) return;
+    const epochLen = data.readUInt32LE(cursor);
+    cursor += 4;
+
+    const inputEpochs: bigint[] = [];
+    for (let i = 0; i < epochLen; i++) {
+      if (cursor + 8 > data.length) return;
+      inputEpochs.push(data.readBigUInt64LE(cursor));
+      cursor += 8;
+    }
+
+    // Mark nullifiers as spent with their respective epochs
+    for (let i = 0; i < nullifiers.length; i++) {
+      const nfEpoch = i < inputEpochs.length ? inputEpochs[i] : 0n;
+      this.noteManager.markSpentByNullifier(nullifiers[i], nfEpoch);
+    }
+
+    // Read output commitments
+    if (data.length < cursor + 4) return;
+    const cmLen = data.readUInt32LE(cursor);
+    cursor += 4;
+
+    const commitments: Uint8Array[] = [];
+    for (let i = 0; i < cmLen; i++) {
+      if (cursor + 32 > data.length) return;
+      commitments.push(new Uint8Array(data.subarray(cursor, cursor + 32)));
+      cursor += 32;
+    }
+
+    // Read leaf indices
+    if (data.length < cursor + 4) return;
+    const idxLen = data.readUInt32LE(cursor);
+    cursor += 4;
+
+    const leafIndices: number[] = [];
+    for (let i = 0; i < idxLen; i++) {
+      if (cursor + 8 > data.length) return;
+      leafIndices.push(Number(data.readBigUInt64LE(cursor)));
+      cursor += 8;
+    }
+
+    console.log(
+      `🔍 Scanner: V2 Transfer - outputEpoch=${outputEpoch}, outputs=${cmLen}`,
+    );
+
+    // Promote pending notes
+    const pending = (this.noteManager as any).pendingNotes as
+      | Note[]
+      | undefined;
+    if (pending) {
+      for (let i = 0; i < commitments.length; i++) {
+        const cm = commitments[i];
+        const idx = pending.findIndex((n) => arraysEqual(n.commitment, cm));
+        if (idx !== -1) {
+          const note = pending[idx];
+          note.epoch = outputEpoch;
+          note.leafIndex = i < leafIndices.length ? leafIndices[i] : 0;
+          this.noteManager.addNote(note);
+        }
+      }
+    }
+  }
+
+  /**
+   * Handle renew events (epoch migration)
+   * Layout: discriminator(8) | old_epoch(u64) | new_epoch(u64) | pool_id(32) |
+   *         old_nullifier(32) | new_commitment(32) | new_leaf_index(u64)
+   */
+  private async handleRenewEvent(data: Buffer): Promise<void> {
+    if (!this.noteManager) return;
+
+    const minimum = 8 + 8 + 8 + 32 + 32 + 32 + 8;
+    if (data.length < minimum) return;
+
+    let cursor = 8; // skip discriminator
+
+    const oldEpoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+
+    const newEpoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+
+    // Skip pool_id
+    cursor += 32;
+
+    // Extract old nullifier (marks old note as spent)
+    const oldNullifier = data.subarray(cursor, cursor + 32);
+    cursor += 32;
+
+    // Extract new commitment
+    const newCommitment = data.subarray(cursor, cursor + 32);
+    cursor += 32;
+
+    // Extract new leaf index
+    const newLeafIndex = Number(data.readBigUInt64LE(cursor));
+
+    console.log(
+      `🔍 Scanner: Renew - epoch ${oldEpoch} -> ${newEpoch}, leafIndex=${newLeafIndex}`,
+    );
+
+    // Mark old note as spent
+    this.noteManager.markSpentByNullifier(oldNullifier, oldEpoch);
+
+    // Promote pending new note
+    const pending = (this.noteManager as any).pendingNotes as
+      | Note[]
+      | undefined;
+    if (pending) {
+      const idx = pending.findIndex((n) =>
+        arraysEqual(n.commitment, newCommitment),
+      );
+      if (idx !== -1) {
+        const note = pending[idx];
+        note.epoch = newEpoch;
+        note.leafIndex = newLeafIndex;
+        this.noteManager.addNote(note);
+      }
+    }
+  }
+
+  /**
+   * Handle epoch rollover events
+   * Layout: discriminator(8) | old_epoch(u64) | new_epoch(u64) | slot(u64)
+   */
+  private async handleEpochRolloverEvent(data: Buffer): Promise<void> {
+    const minimum = 8 + 8 + 8 + 8;
+    if (data.length < minimum) return;
+
+    let cursor = 8;
+    const oldEpoch = data.readBigUInt64LE(cursor);
+    cursor += 8;
+    const newEpoch = data.readBigUInt64LE(cursor);
+
+    console.log(`🔍 Scanner: Epoch rollover - ${oldEpoch} -> ${newEpoch}`);
+
+    // Notify callbacks
+    for (const cb of this.epochCallbacks) {
+      try {
+        cb(oldEpoch, EpochState.Frozen);
+        cb(newEpoch, EpochState.Active);
+      } catch (e) {
+        console.warn("Epoch callback error:", e);
+      }
+    }
+  }
+
+  /**
+   * Handle epoch finalized events
+   * Layout: discriminator(8) | epoch(u64) | final_root(32) | slot(u64)
+   */
+  private async handleEpochFinalizedEvent(data: Buffer): Promise<void> {
+    const minimum = 8 + 8 + 32 + 8;
+    if (data.length < minimum) return;
+
+    let cursor = 8;
+    const epoch = data.readBigUInt64LE(cursor);
+
+    console.log(`🔍 Scanner: Epoch finalized - ${epoch}`);
+
+    // Notify callbacks
+    for (const cb of this.epochCallbacks) {
+      try {
+        cb(epoch, EpochState.Finalized);
+      } catch (e) {
+        console.warn("Epoch callback error:", e);
+      }
+    }
+  }
+
   /**
    * Try to decrypt a note with our viewing key
    */
   private async tryDecryptNote(
     commitment: Buffer,
-    encryptedNote: Buffer
+    encryptedNote: Buffer,
   ): Promise<Note | null> {
     if (!this.viewingKey) return null;
 

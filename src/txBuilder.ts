@@ -1,5 +1,12 @@
 /**
- * TransactionBuilder - Builds transactions for deposits, withdrawals, and transfers
+ * TransactionBuilder - Epoch-aware transaction building for deposits, withdrawals,
+ * transfers, renewals, and epoch lifecycle operations.
+ *
+ * Epoch Architecture:
+ * - Deposits go into the current active epoch's Merkle tree
+ * - Withdrawals and transfers consume notes from active/frozen epochs
+ * - Renewals migrate notes from expiring epochs to the current epoch
+ * - Epoch lifecycle (rollover, finalize, GC) is permissionless
  */
 
 import {
@@ -16,123 +23,246 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import { Note, SpendingKeys, MerkleProof, NULLIFIER_CHUNK_SIZE } from "./types";
+import {
+  Note,
+  SpendingKeys,
+  MerkleProof,
+  EpochInfo,
+  EpochState,
+  GarbageCollectInfo,
+  PoolConfig,
+} from "./types";
 import {
   ProverArtifacts,
   ProverOptions,
   proveWithdraw,
   proveTransfer,
+  proveRenew,
 } from "./prover";
-import { MerkleTreeSync } from "./merkle";
+import { EpochMerkleTree, EpochMerkleTreeManager } from "./merkle";
 import { computeNullifier, serializeNote, encryptNote } from "./crypto";
+import {
+  MERKLE_CONFIG,
+  PDA_SEEDS,
+  EPOCH_TIMING,
+  PROVER_ARTIFACTS,
+} from "./config";
 
+/**
+ * Result of building a transaction that includes rent recovery information
+ */
+export interface TransactionWithGCInfo {
+  transaction: Transaction;
+  gcInfo?: GarbageCollectInfo;
+}
+
+/**
+ * Epoch-aware transaction builder for the shielded pool
+ */
 export class TransactionBuilder {
   private program: Program;
-  private poolConfig: PublicKey;
+  private poolConfigPda: PublicKey;
   private connection: Connection;
 
-  constructor(program: Program, poolConfig: PublicKey, connection: Connection) {
+  constructor(
+    program: Program,
+    poolConfigPda: PublicKey,
+    connection: Connection,
+  ) {
     this.program = program;
-    this.poolConfig = poolConfig;
+    this.poolConfigPda = poolConfigPda;
     this.connection = connection;
   }
 
+  // ============================================================
+  // EPOCH LIFECYCLE OPERATIONS (Permissionless)
+  // ============================================================
+
   /**
-   * Build a deposit transaction
+   * Build a transaction to rollover to a new epoch.
+   * This freezes the current epoch and creates a new active epoch.
+   * Can be called by anyone once conditions are met.
+   */
+  async buildRolloverEpoch(
+    caller: PublicKey,
+    newEpoch: bigint,
+  ): Promise<Transaction> {
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }));
+
+    const epochBytes = this.epochToBytes(newEpoch);
+    const currentEpoch = newEpoch - 1n;
+    const currentEpochBytes = this.epochToBytes(currentEpoch);
+
+    // Derive PDAs for current and new epoch trees
+    const [currentEpochTree] = this.deriveEpochTree(currentEpoch);
+    const [newEpochTree] = this.deriveEpochTree(newEpoch);
+
+    const ix = await (this.program.methods as any)
+      .rolloverEpoch(new BN(newEpoch.toString()))
+      .accounts({
+        poolConfig: this.poolConfigPda,
+        currentEpochTree,
+        newEpochTree,
+        caller,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+
+    tx.add(ix);
+    return tx;
+  }
+
+  /**
+   * Build a transaction to finalize an epoch after its freeze period.
+   * This computes the final Merkle root and marks the epoch as finalized.
+   */
+  async buildFinalizeEpoch(
+    caller: PublicKey,
+    epoch: bigint,
+  ): Promise<Transaction> {
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
+
+    const [epochTree] = this.deriveEpochTree(epoch);
+
+    const ix = await (this.program.methods as any)
+      .finalizeEpoch(new BN(epoch.toString()))
+      .accounts({
+        poolConfig: this.poolConfigPda,
+        epochTree,
+        caller,
+      })
+      .instruction();
+
+    tx.add(ix);
+    return tx;
+  }
+
+  /**
+   * Build a transaction to garbage collect an expired epoch.
+   * Returns rent to the caller from closed accounts.
+   */
+  async buildGarbageCollect(
+    caller: PublicKey,
+    epoch: bigint,
+  ): Promise<TransactionWithGCInfo> {
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }));
+
+    const [epochTree] = this.deriveEpochTree(epoch);
+
+    // Estimate rent recovery
+    const epochTreeInfo = await this.connection.getAccountInfo(epochTree);
+    const estimatedRentRecovery = epochTreeInfo?.lamports ?? 0;
+
+    // Find all leaf chunks for this epoch that can be GC'd
+    const leafChunks = await this.findEpochLeafChunks(epoch);
+    let totalRentRecovery = estimatedRentRecovery;
+
+    for (const chunkInfo of leafChunks) {
+      totalRentRecovery += chunkInfo.lamports;
+    }
+
+    const ix = await (this.program.methods as any)
+      .garbageCollect(new BN(epoch.toString()))
+      .accounts({
+        poolConfig: this.poolConfigPda,
+        epochTree,
+        beneficiary: caller,
+        caller,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts(
+        leafChunks.map((chunk) => ({
+          pubkey: chunk.pubkey,
+          isWritable: true,
+          isSigner: false,
+        })),
+      )
+      .instruction();
+
+    tx.add(ix);
+
+    return {
+      transaction: tx,
+      gcInfo: {
+        epochsAvailable: [epoch],
+        estimatedRentRecovery: BigInt(totalRentRecovery),
+        accountsToClose: 1 + leafChunks.length,
+      },
+    };
+  }
+
+  // ============================================================
+  // DEPOSIT
+  // ============================================================
+
+  /**
+   * Build a deposit transaction into the current active epoch
    */
   async buildDeposit(
     depositor: PublicKey,
     outputNote: Note,
-    merkleTree: MerkleTreeSync
+    epochTree: EpochMerkleTree,
   ): Promise<Transaction> {
     const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }));
 
-    // Fetch PoolConfig to get mint
-    const poolConfigData = await (this.program.account as any).poolConfig.fetch(
-      this.poolConfig
-    );
-    const mint: PublicKey = poolConfigData.mint;
+    // Fetch pool config to get mint and current epoch
+    const poolConfigData = await this.fetchPoolConfig();
+    const mint = new PublicKey(poolConfigData.mint);
+    const currentEpoch = BigInt(poolConfigData.currentEpoch.toString());
 
-    // Derive on-chain PDAs (must match program seeds)
-    const [poolTree] = PublicKey.findProgramAddressSync(
-      [Buffer.from("tree"), mint.toBuffer()],
-      this.program.programId
-    );
-    const [vaultAuthority] = PublicKey.findProgramAddressSync(
-      [Buffer.from("vault"), mint.toBuffer()],
-      this.program.programId
-    );
+    // Validate we're depositing to the active epoch
+    if (epochTree.epoch !== currentEpoch) {
+      throw new Error(
+        `Cannot deposit to epoch ${epochTree.epoch}, current active epoch is ${currentEpoch}`,
+      );
+    }
 
-    // Associated token accounts (using standard SPL Token program)
+    // Derive PDAs
+    const [epochTreePda] = this.deriveEpochTree(currentEpoch);
+    const [vaultAuthority] = this.deriveVaultAuthority(mint);
+
+    // Get next leaf index in this epoch's tree
+    const nextLeafIndex = epochTree.getNextIndex();
+    const [leafChunk] = this.deriveEpochLeafChunk(currentEpoch, nextLeafIndex);
+
+    // Token accounts
     const userTokenAccount = getAssociatedTokenAddressSync(
       mint,
       depositor,
       false,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
     );
     const vaultTokenAccount = getAssociatedTokenAddressSync(
       mint,
       vaultAuthority,
       true,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID
     );
 
-    // Check if vault token account exists, if not create it
-    const connection = this.program.provider.connection;
-    const vaultAccountInfo = await connection.getAccountInfo(vaultTokenAccount);
-    if (!vaultAccountInfo) {
-      const { createAssociatedTokenAccountInstruction } = await import(
-        "@solana/spl-token"
-      );
-      const createAtaIx = createAssociatedTokenAccountInstruction(
-        depositor,
-        vaultTokenAccount,
-        vaultAuthority,
-        mint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      tx.add(createAtaIx);
-    }
-
-    // Ensure user token account exists for the depositor
-    const userAccountInfo = await connection.getAccountInfo(userTokenAccount);
-    if (!userAccountInfo) {
-      const { createAssociatedTokenAccountInstruction } = await import(
-        "@solana/spl-token"
-      );
-      const createUserAtaIx = createAssociatedTokenAccountInstruction(
-        depositor,
-        userTokenAccount,
-        depositor,
-        mint,
-        TOKEN_PROGRAM_ID,
-        ASSOCIATED_TOKEN_PROGRAM_ID
-      );
-      tx.add(createUserAtaIx);
-    }
-
-    // Next leaf index & chunk
-    const nextLeafIndex = await merkleTree.getNextIndex();
-    const chunkIndex = Math.floor(nextLeafIndex / 256);
-    const [leafChunk] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("leaf"),
-        mint.toBuffer(),
-        new BN(chunkIndex).toArrayLike(Buffer, "be", 4),
-      ],
-      this.program.programId
+    // Serialize and encrypt note
+    const serialized = serializeNote(
+      outputNote.value,
+      outputNote.token.toBytes(),
+      outputNote.owner,
+      outputNote.randomness,
+      outputNote.memo,
     );
+    const encrypted = encryptNote(serialized, outputNote.owner);
 
-    // Check if leaf chunk exists, if not initialize it
-    const leafChunkInfo = await connection.getAccountInfo(leafChunk);
+    // Ensure leaf chunk exists
+    const leafChunkInfo = await this.connection.getAccountInfo(leafChunk);
     if (!leafChunkInfo) {
       const initLeafChunkIx = await (this.program.methods as any)
-        .initializeLeafChunk(chunkIndex)
+        .initializeEpochLeafChunk(
+          new BN(currentEpoch.toString()),
+          Math.floor(nextLeafIndex / MERKLE_CONFIG.LEAVES_PER_CHUNK),
+        )
         .accounts({
-          mint: mint,
+          leafChunk,
+          epochTree: epochTreePda,
+          poolConfig: this.poolConfigPda,
           payer: depositor,
           systemProgram: SystemProgram.programId,
         })
@@ -140,143 +270,131 @@ export class TransactionBuilder {
       tx.add(initLeafChunkIx);
     }
 
-    // Encrypt note payload
-    const serialized = serializeNote(
-      outputNote.value,
-      outputNote.token.toBytes(),
-      outputNote.owner,
-      outputNote.randomness,
-      outputNote.memo
-    );
-    const encrypted = encryptNote(serialized, outputNote.owner);
+    // Build deposit instruction
+    const depositAmount = new BN(outputNote.value.toString());
 
-    // Build deposit instruction aligning account names with program
-    const commitmentBytes = Buffer.from(outputNote.commitment);
-    if (commitmentBytes.length !== 32) {
-      throw new Error(
-        `commitment must be 32 bytes, got ${commitmentBytes.length}`
-      );
-    }
-    const encryptedPayload = Buffer.concat([
-      Buffer.from(encrypted.nonce),
-      Buffer.from(encrypted.encrypted),
-    ]);
-    const tagBytes = Buffer.alloc(16, 0);
-
-    const methodBuilder = (this.program.methods as any).depositShielded(
-      new BN(outputNote.value.toString()),
-      Array.from(commitmentBytes),
-      encryptedPayload,
-      Array.from(tagBytes)
-    );
-
-    const ix = await methodBuilder
+    const ix = await (this.program.methods as any)
+      .depositV2(
+        depositAmount,
+        Array.from(outputNote.commitment),
+        Array.from(encrypted.encrypted),
+        Array.from(encrypted.nonce),
+      )
       .accounts({
-        poolConfig: this.poolConfig,
-        poolTree: poolTree,
-        mint: mint,
-        userTokenAccount: userTokenAccount,
-        vaultTokenAccount: vaultTokenAccount,
+        poolConfig: this.poolConfigPda,
+        epochTree: epochTreePda,
+        leafChunk,
+        vaultAuthority,
+        mint,
+        vaultTokenAccount,
+        userTokenAccount,
         user: depositor,
         tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([
-        { pubkey: leafChunk, isWritable: true, isSigner: false },
-      ])
       .instruction();
 
     tx.add(ix);
     return tx;
   }
 
+  // ============================================================
+  // WITHDRAW
+  // ============================================================
+
   /**
-   * Build a withdrawal transaction
+   * Build a withdrawal transaction spending a note from a specific epoch
    */
   async buildWithdraw(
     inputNote: Note,
-    withdrawAmount: bigint,
-    recipient: PublicKey,
     spendingKeys: SpendingKeys,
-    merkleTree: MerkleTreeSync,
+    recipient: PublicKey,
+    withdrawAmount: bigint,
+    epochTree: EpochMerkleTree,
     proverArtifacts?: ProverArtifacts,
-    proverOptions?: ProverOptions
+    proverOptions?: ProverOptions,
   ): Promise<Transaction> {
-    console.log("🔧 buildWithdraw called");
-    console.log("   Input note leaf index:", inputNote.leafIndex);
     const tx = new Transaction();
-    const connection = this.program.provider.connection as Connection;
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
 
-    console.log("🌲 Getting merkle proof...");
-    const merkleProof = await merkleTree.getProof(inputNote.leafIndex || 0);
-    console.log("✅ Got merkle proof, getting root...");
-    const merkleRoot = merkleTree.getRoot();
-    console.log("✅ Got merkle root");
+    // Validate note epoch matches tree
+    if (inputNote.epoch !== epochTree.epoch) {
+      throw new Error(
+        `Note epoch ${inputNote.epoch} does not match tree epoch ${epochTree.epoch}`,
+      );
+    }
 
-    console.log("   Computing nullifier...");
-    console.log("   Commitment length:", inputNote.commitment.length);
-    console.log("   NullifierKey length:", spendingKeys.nullifierKey.length);
-    const nullifier = await computeNullifier(
-      inputNote.commitment,
-      spendingKeys.nullifierKey
-    );
-    console.log("   Nullifier computed, length:", nullifier.length);
+    const epoch = epochTree.epoch;
+    const leafIndex = inputNote.leafIndex ?? 0;
 
-    const poolConfigData = await (this.program.account as any).poolConfig.fetch(
-      this.poolConfig
-    );
-    const mint = poolConfigData.mint;
-    const vaultAuthority = poolConfigData.vaultAuthority;
-    const chunkSize =
-      Number(poolConfigData.nullifierChunkSize ?? NULLIFIER_CHUNK_SIZE) ||
-      NULLIFIER_CHUNK_SIZE;
+    // Fetch pool config
+    const poolConfigData = await this.fetchPoolConfig();
+    const mint = new PublicKey(poolConfigData.mint);
 
-    const [vaultTokenAccount] = PublicKey.findProgramAddressSync(
-      [vaultAuthority.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-      new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-    );
+    // Validate epoch is spendable (active or frozen, not finalized/expired)
+    await this.validateEpochSpendable(epoch);
 
-    const [poolTree] = PublicKey.findProgramAddressSync(
-      [Buffer.from("tree"), mint.toBuffer()],
-      this.program.programId
-    );
-
-    const { address: nullifierChunk, index: nullifierChunkIndex } =
-      this.deriveNullifierChunk(nullifier, chunkSize);
+    // Derive PDAs
+    const [epochTreePda] = this.deriveEpochTree(epoch);
+    const [vaultAuthority] = this.deriveVaultAuthority(mint);
     const [withdrawVerifier] = this.deriveVerifierConfig("withdraw");
 
-    const [userTokenAccount] = PublicKey.findProgramAddressSync(
-      [recipient.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-      new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    // Compute epoch-aware nullifier
+    const nullifier = await computeNullifier(
+      inputNote.commitment,
+      spendingKeys.nullifierKey,
+      epoch,
+      leafIndex,
     );
 
-    console.log("📍 Calling proveWithdraw...");
-    console.log("   Note value:", inputNote.value.toString());
-    console.log("   Merkle proof siblings:", merkleProof.siblings.length);
-    console.log("   Leaf index:", merkleProof.leafIndex);
+    // Derive NullifierMarker PDA (O(1) lookup)
+    const [nullifierMarker] = this.deriveNullifierMarker(epoch, nullifier);
 
-    const { PROVER_ARTIFACTS } = await import("./config");
-    const defaultArtifacts = PROVER_ARTIFACTS.withdraw;
+    // Check if nullifier already exists (double-spend check)
+    const nullifierInfo = await this.connection.getAccountInfo(nullifierMarker);
+    if (nullifierInfo) {
+      throw new Error("Note has already been spent (nullifier exists)");
+    }
+
+    // Get Merkle proof
+    const merkleProof = epochTree.getProof(leafIndex);
+    const merkleRoot = epochTree.getRoot();
+
+    // Token accounts
+    const userTokenAccount = getAssociatedTokenAddressSync(
+      mint,
+      recipient,
+      false,
+    );
+    const vaultTokenAccount = getAssociatedTokenAddressSync(
+      mint,
+      vaultAuthority,
+      true,
+    );
+
+    // Generate proof
+    console.log("📍 Generating withdraw proof...");
+    console.log(`   Note epoch: ${epoch}, leafIndex: ${leafIndex}`);
+    console.log(`   Note value: ${inputNote.value.toString()}`);
+
+    const artifacts = proverArtifacts || PROVER_ARTIFACTS.withdraw;
     const { proof, publicInputs } = await proveWithdraw(
-      proverArtifacts || defaultArtifacts,
+      artifacts,
       {
         note: inputNote,
         spendingKeys,
         merkleProof,
-        merkleRoot: merkleRoot,
+        merkleRoot,
         recipient,
         amount: withdrawAmount,
-        poolConfig: this.poolConfig,
+        poolConfig: this.poolConfigPda,
+        epoch,
+        leafIndex,
       },
-      proverOptions
+      proverOptions,
     );
 
     console.log("✅ Proof generated successfully");
-    console.log(
-      "🔎 Withdraw publicInputs (prover formatted):",
-      publicInputs.map(
-        (pi) => Buffer.from(pi).toString("hex").slice(0, 16) + "..."
-      )
-    );
 
     const proofBytes = Buffer.concat([
       Buffer.from(proof.a),
@@ -284,77 +402,54 @@ export class TransactionBuilder {
       Buffer.from(proof.c),
     ]);
 
-    // Ensure nullifier chunk account exists so program can mark spends
-    const chunkInfo = await connection.getAccountInfo(nullifierChunk);
-    if (!chunkInfo) {
-      const initNullifierIx = await (this.program.methods as any)
-        .initializeNullifierChunk(
-          Array.from(this.poolConfig.toBuffer()),
-          nullifierChunkIndex
-        )
-        .accounts({
-          nullifierChunk,
-          payer: recipient,
-          systemProgram: SystemProgram.programId,
-        })
-        .instruction();
-      tx.add(initNullifierIx);
-    }
-
-    const nIn = 1;
+    // Build withdraw instruction
     const ix = await (this.program.methods as any)
-      .withdrawShielded(
+      .withdrawV2(
         proofBytes,
         publicInputs,
         new BN(withdrawAmount.toString()),
-        nIn
+        new BN(epoch.toString()),
+        leafIndex,
       )
       .accounts({
-        poolConfig: this.poolConfig,
-        poolTree: poolTree,
-        vaultAuthority: vaultAuthority,
-        mint: mint,
-        vaultTokenAccount: vaultTokenAccount,
-        userTokenAccount: userTokenAccount,
+        poolConfig: this.poolConfigPda,
+        epochTree: epochTreePda,
+        nullifierMarker,
+        vaultAuthority,
+        mint,
+        vaultTokenAccount,
+        userTokenAccount,
         user: recipient,
         tokenProgram: TOKEN_PROGRAM_ID,
         verifierConfig: withdrawVerifier,
+        systemProgram: SystemProgram.programId,
       })
-      .remainingAccounts([
-        {
-          pubkey: nullifierChunk,
-          isWritable: true,
-          isSigner: false,
-        },
-      ])
       .instruction();
 
     tx.add(ix);
     return tx;
   }
 
+  // ============================================================
+  // TRANSFER
+  // ============================================================
+
   /**
-   * Build a shielded transfer transaction
+   * Build a shielded transfer transaction.
+   * Input notes can come from different epochs; outputs go to current epoch.
    */
   async buildTransfer(
     inputNotes: Note[],
     outputNotes: Note[],
     spendingKeys: SpendingKeys,
-    merkleTree: MerkleTreeSync,
-    proverArtifacts?: ProverArtifacts
+    epochManager: EpochMerkleTreeManager,
+    proverArtifacts?: ProverArtifacts,
+    proverOptions?: ProverOptions,
   ): Promise<Transaction> {
     const tx = new Transaction();
-    // Pairing verification is heavy; request a higher CU limit up front
     tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
-    const setupTx = new Transaction();
-    const provider: any = this.program.provider;
-    const user: PublicKey | undefined =
-      provider?.wallet?.publicKey ?? provider?.publicKey;
 
-    if (!user) {
-      throw new Error("Program provider is missing a wallet public key");
-    }
-
+    // Pad to 2 inputs/outputs
     while (inputNotes.length < 2) {
       inputNotes.push(this.createDummyNote());
     }
@@ -365,134 +460,165 @@ export class TransactionBuilder {
     const inputTuple: [Note, Note] = [inputNotes[0], inputNotes[1]];
     const outputTuple: [Note, Note] = [outputNotes[0], outputNotes[1]];
 
-    const proof1 = await merkleTree.getProof(inputTuple[0].leafIndex || 0);
-    const proof2 = await merkleTree.getProof(inputTuple[1].leafIndex || 0);
+    // Fetch pool config
+    const poolConfigData = await this.fetchPoolConfig();
+    const mint = new PublicKey(poolConfigData.mint);
+    const currentEpoch = BigInt(poolConfigData.currentEpoch.toString());
 
+    // Get current epoch tree for outputs
+    const currentTree = epochManager.getTree(currentEpoch);
+    if (!currentTree) {
+      throw new Error(`No tree available for current epoch ${currentEpoch}`);
+    }
+
+    const provider: any = this.program.provider;
+    const user: PublicKey = provider?.wallet?.publicKey ?? provider?.publicKey;
+    if (!user) {
+      throw new Error("Program provider is missing a wallet public key");
+    }
+
+    // Get Merkle proofs and compute nullifiers for each input
+    const inputEpochs = inputTuple.map((n) => n.epoch ?? 0n);
+    const inputLeafIndices = inputTuple.map((n) => n.leafIndex ?? 0);
+
+    // Validate input epochs are spendable
+    for (const epoch of inputEpochs) {
+      if (epoch !== 0n) {
+        await this.validateEpochSpendable(epoch);
+      }
+    }
+
+    // Get trees for input notes
+    const inputTree1 =
+      epochManager.getTree(inputEpochs[0]) ??
+      epochManager.getTree(currentEpoch)!;
+    const inputTree2 =
+      epochManager.getTree(inputEpochs[1]) ??
+      epochManager.getTree(currentEpoch)!;
+
+    const proof1 = inputTree1.getProof(inputLeafIndices[0]);
+    const proof2 = inputTree2.getProof(inputLeafIndices[1]);
+
+    // Compute epoch-aware nullifiers
     const nullifier1 = await computeNullifier(
       inputTuple[0].commitment,
-      spendingKeys.nullifierKey
+      spendingKeys.nullifierKey,
+      inputEpochs[0],
+      inputLeafIndices[0],
     );
     const nullifier2 = await computeNullifier(
       inputTuple[1].commitment,
-      spendingKeys.nullifierKey
+      spendingKeys.nullifierKey,
+      inputEpochs[1],
+      inputLeafIndices[1],
     );
 
-    const poolConfigData = await (this.program.account as any).poolConfig.fetch(
-      this.poolConfig
-    );
-    const mint: PublicKey = poolConfigData.mint;
-    const chunkSize =
-      Number(poolConfigData.nullifierChunkSize ?? NULLIFIER_CHUNK_SIZE) ||
-      NULLIFIER_CHUNK_SIZE;
-
-    const [poolTree] = PublicKey.findProgramAddressSync(
-      [Buffer.from("tree"), mint.toBuffer()],
-      this.program.programId
-    );
-
-    const nextIndex = await merkleTree.getNextIndex();
-    const [leafChunk1] = this.deriveLeafChunk(nextIndex, mint);
-    const [leafChunk2] = this.deriveLeafChunk(nextIndex + 1, mint);
+    // Derive PDAs
+    const [currentEpochTreePda] = this.deriveEpochTree(currentEpoch);
     const [transferVerifier] = this.deriveVerifierConfig("transfer");
+    const [nullifierMarker1] = this.deriveNullifierMarker(
+      inputEpochs[0],
+      nullifier1,
+    );
+    const [nullifierMarker2] = this.deriveNullifierMarker(
+      inputEpochs[1],
+      nullifier2,
+    );
 
-    const merkleRoot = merkleTree.getRoot();
+    // Check for double-spend
+    const nullifier1Info =
+      await this.connection.getAccountInfo(nullifierMarker1);
+    const nullifier2Info =
+      await this.connection.getAccountInfo(nullifierMarker2);
+    if (nullifier1Info || nullifier2Info) {
+      throw new Error("One or more input notes have already been spent");
+    }
 
+    // Output leaf chunks
+    const nextIndex = currentTree.getNextIndex();
+    const [leafChunk1] = this.deriveEpochLeafChunk(currentEpoch, nextIndex);
+    const [leafChunk2] = this.deriveEpochLeafChunk(currentEpoch, nextIndex + 1);
+
+    // Serialize and encrypt output notes
     const serialized1 = serializeNote(
       outputTuple[0].value,
       outputTuple[0].token.toBytes(),
       outputTuple[0].owner,
       outputTuple[0].randomness,
-      outputTuple[0].memo
+      outputTuple[0].memo,
     );
     const serialized2 = serializeNote(
       outputTuple[1].value,
       outputTuple[1].token.toBytes(),
       outputTuple[1].owner,
       outputTuple[1].randomness,
-      outputTuple[1].memo
+      outputTuple[1].memo,
     );
     const encrypted1 = encryptNote(serialized1, outputTuple[0].owner);
     const encrypted2 = encryptNote(serialized2, outputTuple[1].owner);
 
+    // Generate proof
+    console.log("📍 Generating transfer proof...");
     const merkleProofTuple: [MerkleProof, MerkleProof] = [proof1, proof2];
-    const { PROVER_ARTIFACTS } = await import("./config");
-    const defaultTransferArtifacts = PROVER_ARTIFACTS.transfer;
+    const merkleRoot = inputTree1.getRoot();
+
+    const artifacts = proverArtifacts || PROVER_ARTIFACTS.transfer;
     const { proof, publicInputs } = await proveTransfer(
-      proverArtifacts || defaultTransferArtifacts,
+      artifacts,
       {
         inputNotes: inputTuple,
         spendingKeys,
         outputNotes: outputTuple,
         merkleProofs: merkleProofTuple,
-        merkleRoot: merkleRoot,
-        txAnchor: merkleRoot, // simple, non-zero anchor bound to state
-        poolConfig: this.poolConfig,
-      }
+        merkleRoot,
+        txAnchor: merkleRoot,
+        poolConfig: this.poolConfigPda,
+        epoch: currentEpoch,
+        inputLeafIndices: [inputLeafIndices[0], inputLeafIndices[1]],
+      },
+      proverOptions,
     );
 
-    // Transfer circuit expects: root | nullifier1 | nullifier2 | commitment1 | commitment2 | tx_anchor | pool_id | chain_id
-    const transferPublicInputs = publicInputs;
+    console.log("✅ Transfer proof generated");
 
-    const connection = this.program.provider.connection as Connection;
+    const proofBytes = Buffer.concat([
+      Buffer.from(proof.a),
+      Buffer.from(proof.b),
+      Buffer.from(proof.c),
+    ]);
 
-    const { address: nullifierChunk1Addr, index: nullifierChunkIndex1 } =
-      this.deriveNullifierChunk(nullifier1, chunkSize);
-    const { address: nullifierChunk2Addr, index: nullifierChunkIndex2 } =
-      this.deriveNullifierChunk(nullifier2, chunkSize);
-
-    const nullifierChunks = [
-      { address: nullifierChunk1Addr, index: nullifierChunkIndex1 },
-      { address: nullifierChunk2Addr, index: nullifierChunkIndex2 },
-    ];
-
-    const seenNullifierChunks = new Set<string>();
-    for (const { address, index } of nullifierChunks) {
-      const key = address.toBase58();
-      if (seenNullifierChunks.has(key)) continue;
-      seenNullifierChunks.add(key);
-
-      const chunkInfo = await connection.getAccountInfo(address);
-      if (!chunkInfo) {
-        const initNullifierIx = await (this.program.methods as any)
-          .initializeNullifierChunk(
-            Array.from(this.poolConfig.toBuffer()),
-            index
-          )
-          .accounts({
-            nullifierChunk: address,
-            payer: user,
-            systemProgram: SystemProgram.programId,
-          })
-          .instruction();
-        setupTx.add(initNullifierIx);
-      }
-    }
-
-    const leafChunkIndex1 = Math.floor(nextIndex / 256);
-    const leafChunkIndex2 = Math.floor((nextIndex + 1) / 256);
+    // Ensure leaf chunks exist
+    const setupTx = new Transaction();
     const leafChunks = [
-      { address: leafChunk1, index: leafChunkIndex1 },
-      { address: leafChunk2, index: leafChunkIndex2 },
+      {
+        address: leafChunk1,
+        index: Math.floor(nextIndex / MERKLE_CONFIG.LEAVES_PER_CHUNK),
+      },
+      {
+        address: leafChunk2,
+        index: Math.floor((nextIndex + 1) / MERKLE_CONFIG.LEAVES_PER_CHUNK),
+      },
     ];
 
-    // Ensure leaf chunks exist for outputs (avoid duplicate init when indices match)
-    const seenLeafChunk = new Set<string>();
+    const seenChunks = new Set<string>();
     for (const { address, index } of leafChunks) {
       const key = address.toBase58();
-      if (seenLeafChunk.has(key)) continue;
-      seenLeafChunk.add(key);
-      const leafInfo = await connection.getAccountInfo(address);
-      if (!leafInfo) {
-        const initLeafChunkIx = await (this.program.methods as any)
-          .initializeLeafChunk(index)
+      if (seenChunks.has(key)) continue;
+      seenChunks.add(key);
+
+      const chunkInfo = await this.connection.getAccountInfo(address);
+      if (!chunkInfo) {
+        const initIx = await (this.program.methods as any)
+          .initializeEpochLeafChunk(new BN(currentEpoch.toString()), index)
           .accounts({
             leafChunk: address,
-            mint,
+            epochTree: currentEpochTreePda,
+            poolConfig: this.poolConfigPda,
             payer: user,
             systemProgram: SystemProgram.programId,
           })
           .instruction();
-        setupTx.add(initLeafChunkIx);
+        setupTx.add(initIx);
       }
     }
 
@@ -501,47 +627,42 @@ export class TransactionBuilder {
         await (this.program.provider as any).sendAndConfirm(setupTx, []);
       } catch (err: any) {
         const msg = err?.toString?.() || "";
-        const alreadyInUse = msg.includes("already in use");
-        if (!alreadyInUse) {
+        if (!msg.includes("already in use")) {
           throw err;
         }
-        console.warn("Initialize chunk skipped (already exists)");
       }
     }
 
-    const proofBytes = Buffer.concat([
-      Buffer.from(proof.a),
-      Buffer.from(proof.b),
-      Buffer.from(proof.c),
-    ]);
-
+    // Encrypted outputs
     const encryptedNotesOut = [
       Buffer.from(encrypted1.nonce),
       Buffer.from(encrypted2.nonce),
     ];
-
     const tagsOut = [Buffer.alloc(16, 0), Buffer.alloc(16, 0)];
-    const nIn = 2;
-    const nOut = 2;
 
+    // Build transfer instruction
     const ix = await (this.program.methods as any)
-      .shieldedTransfer(
+      .transferV2(
         proofBytes,
-        transferPublicInputs,
+        publicInputs,
         encryptedNotesOut,
         tagsOut.map((buf) => Array.from(buf)),
-        nIn,
-        nOut
+        new BN(currentEpoch.toString()),
+        [new BN(inputEpochs[0].toString()), new BN(inputEpochs[1].toString())],
+        inputLeafIndices,
       )
       .accounts({
-        poolConfig: this.poolConfig,
-        poolTree: poolTree,
+        poolConfig: this.poolConfigPda,
+        epochTree: currentEpochTreePda,
         user,
         verifierConfig: transferVerifier,
+        systemProgram: SystemProgram.programId,
       })
       .remainingAccounts([
-        { pubkey: nullifierChunk1Addr, isWritable: true, isSigner: false },
-        { pubkey: nullifierChunk2Addr, isWritable: true, isSigner: false },
+        // Nullifier markers for inputs
+        { pubkey: nullifierMarker1, isWritable: true, isSigner: false },
+        { pubkey: nullifierMarker2, isWritable: true, isSigner: false },
+        // Leaf chunks for outputs
         { pubkey: leafChunk1, isWritable: true, isSigner: false },
         { pubkey: leafChunk2, isWritable: true, isSigner: false },
       ])
@@ -549,6 +670,225 @@ export class TransactionBuilder {
 
     tx.add(ix);
     return tx;
+  }
+
+  // ============================================================
+  // RENEW (Epoch Migration)
+  // ============================================================
+
+  /**
+   * Build a renew transaction to migrate a note from an old epoch to the current epoch.
+   * This is essential for preventing notes from expiring.
+   */
+  async buildRenew(
+    oldNote: Note,
+    newNote: Note,
+    spendingKeys: SpendingKeys,
+    epochManager: EpochMerkleTreeManager,
+    proverArtifacts?: ProverArtifacts,
+    proverOptions?: ProverOptions,
+  ): Promise<Transaction> {
+    const tx = new Transaction();
+    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }));
+
+    // Fetch pool config
+    const poolConfigData = await this.fetchPoolConfig();
+    const mint = new PublicKey(poolConfigData.mint);
+    const currentEpoch = BigInt(poolConfigData.currentEpoch.toString());
+
+    const oldEpoch = oldNote.epoch ?? 0n;
+    const oldLeafIndex = oldNote.leafIndex ?? 0;
+
+    // Validate old note epoch
+    if (oldEpoch >= currentEpoch) {
+      throw new Error("Renew is only needed for notes in older epochs");
+    }
+    await this.validateEpochSpendable(oldEpoch);
+
+    // Get trees
+    const oldTree = epochManager.getTree(oldEpoch);
+    const currentTree = epochManager.getTree(currentEpoch);
+    if (!oldTree || !currentTree) {
+      throw new Error("Required epoch trees not available");
+    }
+
+    const provider: any = this.program.provider;
+    const user: PublicKey = provider?.wallet?.publicKey ?? provider?.publicKey;
+    if (!user) {
+      throw new Error("Program provider is missing a wallet public key");
+    }
+
+    // Compute nullifier for old note
+    const nullifier = await computeNullifier(
+      oldNote.commitment,
+      spendingKeys.nullifierKey,
+      oldEpoch,
+      oldLeafIndex,
+    );
+
+    // Derive PDAs
+    const [oldEpochTreePda] = this.deriveEpochTree(oldEpoch);
+    const [currentEpochTreePda] = this.deriveEpochTree(currentEpoch);
+    const [renewVerifier] = this.deriveVerifierConfig("renew");
+    const [nullifierMarker] = this.deriveNullifierMarker(oldEpoch, nullifier);
+
+    // Check for double-spend
+    const nullifierInfo = await this.connection.getAccountInfo(nullifierMarker);
+    if (nullifierInfo) {
+      throw new Error("Note has already been spent or renewed");
+    }
+
+    // Get Merkle proof for old note
+    const merkleProof = oldTree.getProof(oldLeafIndex);
+    const merkleRoot = oldTree.getRoot();
+
+    // Output leaf chunk
+    const nextIndex = currentTree.getNextIndex();
+    const [leafChunk] = this.deriveEpochLeafChunk(currentEpoch, nextIndex);
+
+    // Serialize and encrypt new note
+    const serialized = serializeNote(
+      newNote.value,
+      newNote.token.toBytes(),
+      newNote.owner,
+      newNote.randomness,
+      newNote.memo,
+    );
+    const encrypted = encryptNote(serialized, newNote.owner);
+
+    // Generate proof
+    console.log("📍 Generating renew proof...");
+    console.log(`   Migrating from epoch ${oldEpoch} to ${currentEpoch}`);
+
+    const artifacts = proverArtifacts || PROVER_ARTIFACTS.renew;
+    const { proof, publicInputs } = await proveRenew(
+      artifacts,
+      {
+        oldNote,
+        newNote,
+        spendingKeys,
+        merkleProof,
+        merkleRoot,
+        poolConfig: this.poolConfigPda,
+        oldEpoch,
+        newEpoch: currentEpoch,
+        oldLeafIndex,
+      },
+      proverOptions,
+    );
+
+    console.log("✅ Renew proof generated");
+
+    const proofBytes = Buffer.concat([
+      Buffer.from(proof.a),
+      Buffer.from(proof.b),
+      Buffer.from(proof.c),
+    ]);
+
+    // Ensure leaf chunk exists
+    const leafChunkInfo = await this.connection.getAccountInfo(leafChunk);
+    if (!leafChunkInfo) {
+      const initIx = await (this.program.methods as any)
+        .initializeEpochLeafChunk(
+          new BN(currentEpoch.toString()),
+          Math.floor(nextIndex / MERKLE_CONFIG.LEAVES_PER_CHUNK),
+        )
+        .accounts({
+          leafChunk,
+          epochTree: currentEpochTreePda,
+          poolConfig: this.poolConfigPda,
+          payer: user,
+          systemProgram: SystemProgram.programId,
+        })
+        .instruction();
+      tx.add(initIx);
+    }
+
+    // Build renew instruction
+    const ix = await (this.program.methods as any)
+      .renewNote(
+        proofBytes,
+        publicInputs,
+        Array.from(newNote.commitment),
+        Array.from(encrypted.encrypted),
+        Array.from(encrypted.nonce),
+        new BN(oldEpoch.toString()),
+        oldLeafIndex,
+      )
+      .accounts({
+        poolConfig: this.poolConfigPda,
+        oldEpochTree: oldEpochTreePda,
+        newEpochTree: currentEpochTreePda,
+        nullifierMarker,
+        leafChunk,
+        user,
+        verifierConfig: renewVerifier,
+        systemProgram: SystemProgram.programId,
+      })
+      .instruction();
+
+    tx.add(ix);
+    return tx;
+  }
+
+  // ============================================================
+  // HELPER METHODS
+  // ============================================================
+
+  /**
+   * Fetch and parse pool configuration
+   */
+  private async fetchPoolConfig(): Promise<any> {
+    return (this.program.account as any).poolConfig.fetch(this.poolConfigPda);
+  }
+
+  /**
+   * Validate that an epoch is still spendable (not expired)
+   */
+  private async validateEpochSpendable(epoch: bigint): Promise<void> {
+    const [epochTree] = this.deriveEpochTree(epoch);
+    const epochData = await (this.program.account as any).epochTree.fetch(
+      epochTree,
+    );
+
+    if (epochData.state === 3) {
+      // Expired
+      throw new Error(`Epoch ${epoch} has expired and is no longer spendable`);
+    }
+  }
+
+  /**
+   * Find all leaf chunk PDAs for an epoch
+   */
+  private async findEpochLeafChunks(
+    epoch: bigint,
+  ): Promise<{ pubkey: PublicKey; lamports: number }[]> {
+    const results: { pubkey: PublicKey; lamports: number }[] = [];
+    const epochBytes = this.epochToBytes(epoch);
+
+    // Search for leaf chunk accounts with the epoch prefix
+    // In practice, we'd use getProgramAccounts with memcmp filter
+    // For now, iterate through possible chunk indices
+    for (let i = 0; i < 20; i++) {
+      const [leafChunk] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from(PDA_SEEDS.LEAVES),
+          this.poolConfigPda.toBuffer(),
+          epochBytes,
+          new BN(i).toArrayLike(Buffer, "le", 4),
+        ],
+        this.program.programId,
+      );
+
+      const info = await this.connection.getAccountInfo(leafChunk);
+      if (info) {
+        results.push({ pubkey: leafChunk, lamports: info.lamports });
+      } else {
+        break; // Assume contiguous chunk indices
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -564,63 +904,85 @@ export class TransactionBuilder {
       nullifier: new Uint8Array(32),
       randomness: new Uint8Array(32),
       spent: false,
+      epoch: 0n,
+      leafIndex: 0,
     };
   }
 
   /**
-   * Derive nullifier chunk PDA
+   * Convert epoch to 8-byte little-endian buffer
    */
-  private deriveNullifierChunk(
-    nullifier: Uint8Array,
-    chunkSize: number
-  ): { address: PublicKey; bump: number; index: number } {
-    console.log("   Nullifier length:", nullifier.length, "bytes");
-    if (!Number.isInteger(chunkSize) || chunkSize <= 0) {
-      throw new Error(
-        `Invalid nullifier chunk size: ${chunkSize}. Must be positive integer.`
-      );
-    }
+  private epochToBytes(epoch: bigint): Buffer {
+    const buf = Buffer.alloc(8);
+    buf.writeBigUInt64LE(epoch);
+    return buf;
+  }
 
-    const buf = Buffer.from(nullifier);
-    if (buf.length < 4) {
-      throw new Error(
-        `Nullifier too short: ${buf.length} bytes, need at least 4`
-      );
-    }
+  // ============================================================
+  // PDA DERIVATION HELPERS
+  // ============================================================
 
-    const rawIndex = buf.readUInt32BE(0);
-    const maxChunks = Math.max(1, Math.floor(0xffffffff / chunkSize));
-    const chunkIndex = rawIndex % maxChunks;
-    const [address, bump] = PublicKey.findProgramAddressSync(
+  /**
+   * Derive EpochTree PDA for a specific epoch
+   */
+  private deriveEpochTree(epoch: bigint): [PublicKey, number] {
+    const epochBytes = this.epochToBytes(epoch);
+    return PublicKey.findProgramAddressSync(
       [
-        Buffer.from("nullifier"),
-        this.poolConfig.toBuffer(),
-        new BN(chunkIndex).toArrayLike(Buffer, "be", 4),
+        Buffer.from(PDA_SEEDS.EPOCH_TREE),
+        this.poolConfigPda.toBuffer(),
+        epochBytes,
       ],
-      this.program.programId
+      this.program.programId,
     );
-
-    return { address, bump, index: chunkIndex };
   }
 
   /**
-   * Derive leaf chunk PDA
+   * Derive EpochLeafChunk PDA for a specific epoch and leaf index
    */
-  private deriveLeafChunk(
+  private deriveEpochLeafChunk(
+    epoch: bigint,
     leafIndex: number,
-    mint: PublicKey
   ): [PublicKey, number] {
-    const chunkIndex = Math.floor(leafIndex / 256);
-    if (!mint) {
-      throw new Error("mint is required for leaf chunk PDA derivation");
-    }
+    const epochBytes = this.epochToBytes(epoch);
+    const chunkIndex = Math.floor(leafIndex / MERKLE_CONFIG.LEAVES_PER_CHUNK);
     return PublicKey.findProgramAddressSync(
       [
-        Buffer.from("leaf"),
-        mint.toBuffer(),
-        new BN(chunkIndex).toArrayLike(Buffer, "be", 4),
+        Buffer.from(PDA_SEEDS.LEAVES),
+        this.poolConfigPda.toBuffer(),
+        epochBytes,
+        new BN(chunkIndex).toArrayLike(Buffer, "le", 4),
       ],
-      this.program.programId
+      this.program.programId,
+    );
+  }
+
+  /**
+   * Derive NullifierMarker PDA for O(1) double-spend checking
+   */
+  private deriveNullifierMarker(
+    epoch: bigint,
+    nullifier: Uint8Array,
+  ): [PublicKey, number] {
+    const epochBytes = this.epochToBytes(epoch);
+    return PublicKey.findProgramAddressSync(
+      [
+        Buffer.from(PDA_SEEDS.NULLIFIER),
+        this.poolConfigPda.toBuffer(),
+        epochBytes,
+        Buffer.from(nullifier),
+      ],
+      this.program.programId,
+    );
+  }
+
+  /**
+   * Derive vault authority PDA
+   */
+  private deriveVaultAuthority(mint: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("vault"), mint.toBuffer()],
+      this.program.programId,
     );
   }
 
@@ -628,16 +990,15 @@ export class TransactionBuilder {
    * Derive verifier config PDA for a specific circuit
    */
   private deriveVerifierConfig(
-    circuit: "withdraw" | "transfer"
+    circuit: "withdraw" | "transfer" | "renew",
   ): [PublicKey, number] {
-    const circuitSeed =
-      circuit === "withdraw"
-        ? Buffer.from("withdraw")
-        : Buffer.from("transfer");
-
     return PublicKey.findProgramAddressSync(
-      [Buffer.from("verifier"), this.poolConfig.toBuffer(), circuitSeed],
-      this.program.programId
+      [
+        Buffer.from(PDA_SEEDS.VERIFIER),
+        this.poolConfigPda.toBuffer(),
+        Buffer.from(circuit),
+      ],
+      this.program.programId,
     );
   }
 }

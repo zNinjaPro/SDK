@@ -1,29 +1,19 @@
 /**
- * Cryptographic types and constants for the shielded pool
+ * Cryptographic types and constants for the epoch-based shielded pool
  */
 
 import { PublicKey } from "@solana/web3.js";
 
 /** BN254 field size for public inputs */
 export const BN254_FIELD_SIZE = BigInt(
-  "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617",
 );
 
-/** Merkle tree depth - MUST match circuit compilation parameter */
-export const MERKLE_DEPTH = (() => {
-  const env = process.env.MERKLE_DEPTH;
-  if (env) {
-    const n = Number(env);
-    if (Number.isInteger(n) && n > 0 && n <= 64) return n;
-  }
-  return 20;
-})();
+/** Merkle tree depth per epoch (2^12 = 4,096 deposits per epoch) */
+export const MERKLE_DEPTH = 12;
 
-/** Number of leaves per LeafChunk PDA */
+/** Number of leaves per EpochLeafChunk PDA */
 export const LEAF_CHUNK_SIZE = 256;
-
-/** Number of nullifiers per NullifierChunk PDA */
-export const NULLIFIER_CHUNK_SIZE = 256;
 
 /** Size of a BN254 scalar in bytes */
 export const SCALAR_SIZE = 32;
@@ -36,6 +26,49 @@ export const NULLIFIER_SIZE = 32;
 
 /** Size of an encrypted note tag */
 export const TAG_SIZE = 16;
+
+/** Default epoch duration in slots (~2 weeks at 400ms slots) */
+export const DEFAULT_EPOCH_DURATION_SLOTS = 3_024_000n;
+
+/** Default grace period before epoch can be garbage collected (~6 months) */
+export const DEFAULT_EPOCH_EXPIRY_SLOTS = 38_880_000n;
+
+/** Default finalization delay after epoch ends (~1 day) */
+export const DEFAULT_FINALIZATION_DELAY_SLOTS = 216_000n;
+
+/**
+ * Epoch state enum matching on-chain representation
+ */
+export enum EpochState {
+  /** Epoch is active and accepting deposits */
+  Active = 0,
+  /** Epoch is frozen, no more deposits, pending finalization */
+  Frozen = 1,
+  /** Epoch is finalized with committed root, can be spent from */
+  Finalized = 2,
+}
+
+/**
+ * Information about an epoch
+ */
+export interface EpochInfo {
+  /** Epoch number */
+  epoch: bigint;
+  /** Slot when epoch started */
+  startSlot: bigint;
+  /** Slot when epoch ended (0 if still active) */
+  endSlot: bigint;
+  /** Slot when epoch was finalized (0 if not finalized) */
+  finalizedSlot: bigint;
+  /** Current state of the epoch */
+  state: EpochState;
+  /** Finalized merkle root (zero if not finalized) */
+  finalRoot: Uint8Array;
+  /** Number of deposits in this epoch */
+  depositCount: number;
+  /** Slot when epoch will expire (can be garbage collected) */
+  expirySlot: bigint;
+}
 
 /**
  * Represents a note (UTXO) in the shielded pool
@@ -60,10 +93,13 @@ export interface Note {
   /** Commitment: Hash(value, token, owner, randomness) - used as leaf in tree */
   commitment: Uint8Array;
 
-  /** Position in Merkle tree */
+  /** Position in Merkle tree within the epoch (set on confirmation) */
   leafIndex?: number;
 
-  /** Nullifier: Hash(commitment, nullifierKey) */
+  /** Epoch this note belongs to (set on confirmation) */
+  epoch?: bigint;
+
+  /** Nullifier: Hash(commitment, nullifierKey, epoch, leafIndex) */
   nullifier: Uint8Array;
 
   /** Random entropy for commitment */
@@ -71,6 +107,9 @@ export interface Note {
 
   /** Whether this note has been spent */
   spent?: boolean;
+
+  /** Whether this note is in an expired epoch (needs renewal) */
+  expired?: boolean;
 }
 
 /**
@@ -94,19 +133,22 @@ export interface SpendingKeys {
 }
 
 /**
- * Merkle proof for a leaf
+ * Merkle proof for a leaf in an epoch tree
  */
 export interface MerkleProof {
-  /** Leaf value */
+  /** Leaf value (commitment) */
   leaf: Uint8Array;
 
-  /** Leaf index in tree */
+  /** Leaf index in epoch tree */
   leafIndex: number;
 
-  /** Sibling hashes from leaf to root (32 levels) */
+  /** Epoch this proof is for */
+  epoch: bigint;
+
+  /** Sibling hashes from leaf to root (MERKLE_DEPTH levels) */
   siblings: Uint8Array[];
 
-  /** Computed root */
+  /** Computed or finalized root */
   root: Uint8Array;
 }
 
@@ -119,9 +161,6 @@ export interface PoolConfig {
 
   /** Pool config PDA */
   poolConfig: PublicKey;
-
-  /** Pool tree PDA */
-  poolTree: PublicKey;
 
   /** Vault authority PDA */
   vaultAuthority: PublicKey;
@@ -137,65 +176,117 @@ export interface PoolConfig {
 
   /** Chain ID constant */
   chainId: Uint8Array;
+
+  /** Current active epoch */
+  currentEpoch: bigint;
+
+  /** Epoch start slot (for current epoch) */
+  epochStartSlot: bigint;
+
+  /** Epoch duration in slots */
+  epochDurationSlots: bigint;
+
+  /** Expiry period in slots */
+  expirySlots: bigint;
+
+  /** Finalization delay in slots */
+  finalizationDelaySlots: bigint;
+
+  /** Pool authority */
+  authority: PublicKey;
+
+  /** Whether pool is paused */
+  paused: boolean;
 }
 
 /**
  * Event types emitted by the program
  */
 export enum EventType {
-  Deposit = "DepositEventV1",
-  ShieldedTransfer = "ShieldedTransferEventV1",
-  Withdraw = "WithdrawEventV1",
+  Deposit = "DepositEvent",
+  Transfer = "TransferEvent",
+  Withdraw = "WithdrawEvent",
+  Renew = "RenewEvent",
+  EpochRollover = "EpochRolloverEvent",
+  EpochFinalized = "EpochFinalizedEvent",
 }
 
 /**
- * Deposit event data
+ * Deposit event data (v2 epoch-aware)
  */
 export interface DepositEvent {
-  version: number;
-  poolId: Uint8Array;
-  chainId: Uint8Array;
-  cm: Uint8Array;
-  leafIndex: bigint;
-  newRoot: Uint8Array;
-  txAnchor: Uint8Array;
-  tag: Uint8Array;
+  pool: PublicKey;
+  epoch: bigint;
+  commitment: Uint8Array;
+  leafIndex: number;
+  amount: bigint;
   encryptedNote: Uint8Array;
+  timestamp: bigint;
 }
 
 /**
- * Shielded transfer event data
+ * Transfer event data (v2 epoch-aware)
  */
-export interface ShieldedTransferEvent {
-  version: number;
-  poolId: Uint8Array;
-  chainId: Uint8Array;
-  rootPrev: Uint8Array;
-  newRoot: Uint8Array;
-  txAnchor: Uint8Array;
-  nIn: number;
-  nOut: number;
-  nfIn: Uint8Array[];
-  cmOut: Uint8Array[];
-  leafIndexOut: bigint[];
-  tagsOut: Uint8Array[];
-  encNotes: Uint8Array[];
+export interface TransferEvent {
+  pool: PublicKey;
+  spendEpoch: bigint;
+  depositEpoch: bigint;
+  nullifier1: Uint8Array;
+  nullifier2: Uint8Array;
+  outputCommitment1: Uint8Array;
+  outputCommitment2: Uint8Array;
+  leafIndex1: number;
+  leafIndex2: number;
+  encryptedNotes: Uint8Array[];
+  timestamp: bigint;
 }
 
 /**
- * Withdraw event data
+ * Withdraw event data (v2 epoch-aware)
  */
 export interface WithdrawEvent {
-  version: number;
-  poolId: Uint8Array;
-  chainId: Uint8Array;
-  rootPrev: Uint8Array;
-  newRoot: Uint8Array;
-  txAnchor: Uint8Array;
-  nIn: number;
-  nfIn: Uint8Array[];
-  value: bigint;
+  pool: PublicKey;
+  epoch: bigint;
+  nullifier: Uint8Array;
+  amount: bigint;
   recipient: PublicKey;
+  timestamp: bigint;
+}
+
+/**
+ * Renew event data
+ */
+export interface RenewEvent {
+  pool: PublicKey;
+  oldEpoch: bigint;
+  nullifier: Uint8Array;
+  newEpoch: bigint;
+  newCommitment: Uint8Array;
+  newLeafIndex: number;
+  encryptedNote: Uint8Array;
+  timestamp: bigint;
+}
+
+/**
+ * Epoch rollover event data
+ */
+export interface EpochRolloverEvent {
+  pool: PublicKey;
+  previousEpoch: bigint;
+  newEpoch: bigint;
+  previousEpochDepositCount: number;
+  timestamp: bigint;
+}
+
+/**
+ * Epoch finalized event data
+ */
+export interface EpochFinalizedEvent {
+  pool: PublicKey;
+  epoch: bigint;
+  finalRoot: Uint8Array;
+  depositCount: number;
+  timestamp: bigint;
 }
 
 /**
@@ -213,4 +304,53 @@ export interface ClientOptions {
 
   /** Cache directory for storing tree/notes */
   cacheDir?: string;
+
+  /** Slots before expiry to warn about note renewal */
+  renewalWarningSlots?: bigint;
+}
+
+/**
+ * Balance information with epoch details
+ */
+export interface BalanceInfo {
+  /** Total balance (spendable + pending + expiring, excludes expired) */
+  total: bigint;
+
+  /** Total spendable balance (in finalized, non-expired epochs) */
+  spendable: bigint;
+
+  /** Balance in active epoch (pending finalization) */
+  pending: bigint;
+
+  /** Balance in epochs approaching expiry (needs renewal) */
+  expiring: bigint;
+
+  /** Balance in expired epochs (lost if not renewed) */
+  expired: bigint;
+
+  /** Total number of unspent notes */
+  noteCount: number;
+
+  /** Number of notes in expiring epochs */
+  expiringNoteCount: number;
+
+  /** Number of notes in expired epochs */
+  expiredNoteCount: number;
+
+  /** Earliest expiry slot for any note */
+  earliestExpiry?: bigint;
+}
+
+/**
+ * Garbage collection info
+ */
+export interface GarbageCollectInfo {
+  /** Epochs available for garbage collection */
+  epochsAvailable: bigint[];
+
+  /** Estimated rent recovery in lamports */
+  estimatedRentRecovery: bigint;
+
+  /** Number of accounts to be closed */
+  accountsToClose: number;
 }

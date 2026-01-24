@@ -51,7 +51,7 @@ export function poseidonHashSync(inputs: Uint8Array[]): Uint8Array {
 export async function computeCommitment(
   value: bigint,
   owner: Uint8Array,
-  randomness: Uint8Array
+  randomness: Uint8Array,
 ): Promise<Uint8Array> {
   // Encode value as 32-byte big-endian
   const valueBuf = Buffer.alloc(32);
@@ -62,13 +62,28 @@ export async function computeCommitment(
 }
 
 /**
- * Compute nullifier: Hash(commitment || nullifierKey)
+ * Compute nullifier: Hash(commitment, nullifierKey, epoch, leafIndex)
+ * This matches the circuit's Nullifier template which takes 4 inputs.
  */
 export async function computeNullifier(
   commitment: Uint8Array,
-  nullifierKey: Uint8Array
+  nullifierKey: Uint8Array,
+  epoch: bigint,
+  leafIndex: number,
 ): Promise<Uint8Array> {
-  return await poseidonHash([commitment, nullifierKey]);
+  // Encode epoch as 32-byte little-endian (matching circuit)
+  const epochBuf = Buffer.alloc(32);
+  let epochVal = epoch;
+  for (let i = 0; i < 8; i++) {
+    epochBuf[i] = Number(epochVal & 0xffn);
+    epochVal >>= 8n;
+  }
+
+  // Encode leafIndex as 32-byte little-endian
+  const leafIndexBuf = Buffer.alloc(32);
+  leafIndexBuf.writeUInt32LE(leafIndex, 0);
+
+  return await poseidonHash([commitment, nullifierKey, epochBuf, leafIndexBuf]);
 }
 
 /**
@@ -76,7 +91,7 @@ export async function computeNullifier(
  */
 export function encryptNote(
   noteData: Uint8Array,
-  viewingKey: Uint8Array
+  viewingKey: Uint8Array,
 ): { encrypted: Uint8Array; nonce: Uint8Array } {
   const nonce = randomBytes(nacl.secretbox.nonceLength);
   const encrypted = nacl.secretbox(noteData, nonce, viewingKey);
@@ -93,7 +108,7 @@ export function encryptNote(
 export function decryptNote(
   encryptedData: Uint8Array,
   nonce: Uint8Array,
-  viewingKey: Uint8Array
+  viewingKey: Uint8Array,
 ): Uint8Array | null {
   const decrypted = nacl.secretbox.open(encryptedData, nonce, viewingKey);
 
@@ -112,7 +127,7 @@ export function serializeNote(
   token: Uint8Array,
   owner: Uint8Array,
   blinding: Uint8Array,
-  memo?: string
+  memo?: string,
 ): Uint8Array {
   // Format: value (32) || token (32) || owner (32) || blinding (32) || memo_len (2) || memo
   const valueBuf = Buffer.alloc(32);
@@ -124,7 +139,7 @@ export function serializeNote(
   memoLen.writeUInt16LE(memoBytes.length);
 
   return new Uint8Array(
-    Buffer.concat([valueBuf, token, owner, blinding, memoLen, memoBytes])
+    Buffer.concat([valueBuf, token, owner, blinding, memoLen, memoBytes]),
   );
 }
 
@@ -178,7 +193,7 @@ export function bytes32ToBigint(bytes: Uint8Array): bigint {
  */
 export function isInField(value: bigint): boolean {
   const BN254_FIELD_SIZE = BigInt(
-    "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+    "21888242871839275222246405745257275088548364400416034343698204186575808495617",
   );
   return value >= 0n && value < BN254_FIELD_SIZE;
 }

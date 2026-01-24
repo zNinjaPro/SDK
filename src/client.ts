@@ -1,6 +1,12 @@
 /**
- * Main ShieldedPoolClient class
+ * Epoch-aware ShieldedPoolClient class
  * Provides high-level API for interacting with the shielded pool
+ *
+ * Features:
+ * - Automatic epoch management
+ * - Note renewal before expiration
+ * - Epoch lifecycle operations (rollover, finalize, GC)
+ * - Balance breakdown by epoch status
  */
 
 import {
@@ -14,11 +20,19 @@ import { AnchorProvider, Program, Idl } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import { KeyManager } from "./keyManager";
 import { NoteManager } from "./noteManager";
-import { MerkleTreeSync } from "./merkle";
+import { EpochMerkleTree, EpochMerkleTreeManager } from "./merkle";
 import { UTXOScanner } from "./scanner";
 import { TransactionBuilder } from "./txBuilder";
-import { Note, SpendingKeys, PoolConfig as PoolConfigType } from "./types";
-import { PROVER_ARTIFACTS } from "./config";
+import {
+  Note,
+  SpendingKeys,
+  PoolConfig as PoolConfigType,
+  BalanceInfo,
+  EpochInfo,
+  EpochState,
+  GarbageCollectInfo,
+} from "./types";
+import { PROVER_ARTIFACTS, EPOCH_TIMING } from "./config";
 import { poseidonHash } from "./crypto";
 
 export interface ShieldedPoolClientConfig {
@@ -44,13 +58,14 @@ export class ShieldedPoolClient {
 
   private keyManager: KeyManager;
   private noteManager: NoteManager;
-  private merkleTree: MerkleTreeSync;
+  private epochManager: EpochMerkleTreeManager;
   private scanner: UTXOScanner;
   private txBuilder: TransactionBuilder;
   private lastOutputNotes?: Note[];
 
   private spendingKeys?: SpendingKeys;
   private isInitialized: boolean = false;
+  private currentEpoch: bigint = 0n;
 
   constructor(config: ShieldedPoolClientConfig) {
     this.config = config;
@@ -81,7 +96,7 @@ export class ShieldedPoolClient {
           });
         },
       },
-      { commitment: "confirmed" }
+      { commitment: "confirmed" },
     );
 
     // Load or use provided IDL
@@ -94,20 +109,20 @@ export class ShieldedPoolClient {
     // Initialize components (will be fully set up after init())
     this.keyManager = KeyManager.generate(); // Placeholder
     this.noteManager = new NoteManager();
-    this.merkleTree = new MerkleTreeSync(
+    this.epochManager = new EpochMerkleTreeManager(
       this.connection,
       this.program,
-      this.poolConfig
+      this.poolConfig,
     );
     this.scanner = new UTXOScanner(
       this.connection,
       this.program,
-      this.poolConfig
+      this.poolConfig,
     );
     this.txBuilder = new TransactionBuilder(
       this.program,
       this.poolConfig,
-      this.connection
+      this.connection,
     );
   }
 
@@ -115,7 +130,7 @@ export class ShieldedPoolClient {
    * Create a new client with a random mnemonic
    */
   static async create(
-    config: ShieldedPoolClientConfig
+    config: ShieldedPoolClientConfig,
   ): Promise<ShieldedPoolClient> {
     const client = new ShieldedPoolClient(config);
     client.keyManager = KeyManager.generate();
@@ -128,7 +143,7 @@ export class ShieldedPoolClient {
    */
   static async fromMnemonic(
     config: ShieldedPoolClientConfig,
-    mnemonic: string
+    mnemonic: string,
   ): Promise<ShieldedPoolClient> {
     const client = new ShieldedPoolClient(config);
     client.keyManager = KeyManager.fromMnemonic(mnemonic);
@@ -141,7 +156,7 @@ export class ShieldedPoolClient {
    */
   static async fromSeed(
     config: ShieldedPoolClientConfig,
-    seed: Buffer
+    seed: Buffer,
   ): Promise<ShieldedPoolClient> {
     const client = new ShieldedPoolClient(config);
     client.keyManager = KeyManager.fromSeed(new Uint8Array(seed));
@@ -171,14 +186,16 @@ export class ShieldedPoolClient {
     // Configure note manager with keys
     this.noteManager = new NoteManager(this.spendingKeys);
 
-    // Sync merkle tree from chain; in testMode tolerate missing poolConfig
+    // Sync epoch manager from chain; in testMode tolerate missing poolConfig
     try {
-      await this.merkleTree.sync();
+      await this.epochManager.sync();
+      this.currentEpoch = this.epochManager.getCurrentEpoch();
+      this.noteManager.setCurrentEpoch(this.currentEpoch);
     } catch (e) {
       if (this.config?.testMode) {
         console.warn(
-          "⚠️ Merkle sync skipped in testMode:",
-          (e as Error).message
+          "⚠️ Epoch sync skipped in testMode:",
+          (e as Error).message,
         );
       } else {
         throw e;
@@ -188,6 +205,14 @@ export class ShieldedPoolClient {
     // Start scanner unless in test mode
     if (!this.config?.testMode) {
       await this.scanner.start(this.spendingKeys.viewingKey, this.noteManager);
+
+      // Register epoch change callback
+      this.scanner.onEpochChange((epoch, state) => {
+        if (state === EpochState.Active) {
+          this.currentEpoch = epoch;
+          this.noteManager.setCurrentEpoch(epoch);
+        }
+      });
     }
 
     this.isInitialized = true;
@@ -209,7 +234,7 @@ export class ShieldedPoolClient {
   }
 
   /**
-   * Get the current shielded balance
+   * Get the current shielded balance (spendable only)
    */
   async getBalance(): Promise<bigint> {
     this.ensureInitialized();
@@ -218,6 +243,47 @@ export class ShieldedPoolClient {
       return confirmed + this.noteManager.calculatePendingBalance();
     }
     return confirmed;
+  }
+
+  /**
+   * Get detailed balance breakdown by epoch status
+   */
+  async getBalanceInfo(): Promise<BalanceInfo> {
+    this.ensureInitialized();
+    return this.noteManager.calculateBalanceInfo();
+  }
+
+  /**
+   * Get current epoch information
+   */
+  async getEpochInfo(): Promise<EpochInfo> {
+    this.ensureInitialized();
+    const info = await this.epochManager.getEpochInfo(this.currentEpoch);
+    if (!info) {
+      throw new Error(`Epoch ${this.currentEpoch} not found`);
+    }
+    return info;
+  }
+
+  /**
+   * Get the current epoch number
+   */
+  getCurrentEpoch(): bigint {
+    return this.currentEpoch;
+  }
+
+  /**
+   * Check if any notes need renewal (expiring soon)
+   */
+  async checkExpiringNotes(): Promise<{
+    count: number;
+    value: bigint;
+    notes: Note[];
+  }> {
+    this.ensureInitialized();
+    const expiringNotes = this.noteManager.getExpiringNotes();
+    const value = expiringNotes.reduce((sum, n) => sum + n.value, 0n);
+    return { count: expiringNotes.length, value, notes: expiringNotes };
   }
 
   /**
@@ -236,7 +302,7 @@ export class ShieldedPoolClient {
   }
 
   /**
-   * Deposit tokens into the shielded pool
+   * Deposit tokens into the shielded pool (current epoch)
    */
   async deposit(amount: bigint): Promise<string> {
     this.ensureInitialized();
@@ -245,17 +311,25 @@ export class ShieldedPoolClient {
       throw new Error("Payer required for deposit");
     }
 
-    // Create a new output note
+    // Create a new output note for current epoch
     const outputNote = await this.noteManager.createNote(
       amount,
-      this.keyManager.getSpendingKey()
+      this.keyManager.getSpendingKey(),
     );
+
+    // Get current epoch tree
+    const currentTree = this.epochManager.getTree(this.currentEpoch);
+    if (!currentTree) {
+      throw new Error(
+        `No tree available for current epoch ${this.currentEpoch}`,
+      );
+    }
 
     // Build deposit transaction
     const tx = await this.txBuilder.buildDeposit(
       this.payer.publicKey,
       outputNote,
-      this.merkleTree
+      currentTree,
     );
 
     // Sign and send
@@ -267,27 +341,19 @@ export class ShieldedPoolClient {
     // In normal mode, rescan to promote pending note; in test mode, directly promote to confirmed
     if (!this.config?.testMode) {
       await this.scanner.rescanSignature(signature);
-      // Refresh merkle tree to include new leaf
-      await this.merkleTree.sync();
+      // Refresh epoch manager to include new leaf
+      await this.epochManager.sync();
     } else {
       // In test mode, immediately promote pending to confirmed
-      // We need to fetch the leafIndex from the chain
       const poolConfigAccount = await (
         this.program.account as any
       ).poolConfig.fetch(this.poolConfig);
-      const mint = poolConfigAccount.mint;
-      const [poolTreePDA] = PublicKey.findProgramAddressSync(
-        [Buffer.from("tree"), mint.toBuffer()],
-        this.programId
-      );
-      const poolTree = await (this.program.account as any).poolTree.fetch(
-        poolTreePDA
-      );
-      const leafIndex = Number(poolTree.nextIndex) - 1; // Just deposited, so it's the previous index
+      const epochTree = await this.fetchCurrentEpochTree();
+      const leafIndex = Number(epochTree.nextIndex) - 1;
       outputNote.leafIndex = leafIndex;
+      outputNote.epoch = this.currentEpoch;
       this.noteManager.addNote(outputNote);
-      // Also sync merkle tree to include the new leaf
-      await this.merkleTree.sync();
+      await this.epochManager.sync();
     }
 
     // Debug: Check what notes we have
@@ -295,7 +361,7 @@ export class ShieldedPoolClient {
     console.log("📋 Notes after deposit:");
     allNotes.forEach((n, i) => {
       console.log(
-        `   Note ${i}: value=${n.value}, commitment_len=${n.commitment.length}, leafIndex=${n.leafIndex}`
+        `   Note ${i}: value=${n.value}, epoch=${n.epoch}, leafIndex=${n.leafIndex}`,
       );
     });
 
@@ -307,7 +373,7 @@ export class ShieldedPoolClient {
    */
   async waitForBalance(
     minBalance: bigint,
-    timeoutMs: number = 30000
+    timeoutMs: number = 30000,
   ): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -324,8 +390,8 @@ export class ShieldedPoolClient {
   async withdraw(amount: bigint, recipient: PublicKey): Promise<string> {
     this.ensureInitialized();
 
-    // Always sync before proving to avoid stale roots, even in testMode.
-    await this.merkleTree.sync();
+    // Always sync before proving to avoid stale roots
+    await this.epochManager.sync();
 
     if (!this.spendingKeys) {
       throw new Error("Spending keys not initialized");
@@ -341,7 +407,7 @@ export class ShieldedPoolClient {
         error.message.includes("Insufficient note count")
       ) {
         throw new Error(
-          "Insufficient spendable notes for withdrawal. Deposit or wait for notes to confirm."
+          "Insufficient spendable notes for withdrawal. Deposit or wait for notes to confirm.",
         );
       }
       throw error;
@@ -352,34 +418,41 @@ export class ShieldedPoolClient {
 
     // Use the first note that covers the amount
     const inputNote = inputNotes[0];
-    if (inputNote.leafIndex === undefined) {
-      throw new Error("Input note missing leaf index; resync and retry");
+    if (inputNote.leafIndex === undefined || inputNote.epoch === undefined) {
+      throw new Error(
+        "Input note missing epoch or leaf index; resync and retry",
+      );
     }
+
     console.log("📝 Selected note for withdrawal:");
     console.log("   Value:", inputNote.value.toString());
-    console.log("   Commitment length:", inputNote.commitment.length);
-    console.log(
-      "   Commitment (hex):",
-      Buffer.from(inputNote.commitment).toString("hex").slice(0, 64)
-    );
-    // Resolve prover artifacts (allow override via baseDir, else defaults)
+    console.log("   Epoch:", inputNote.epoch.toString());
+    console.log("   LeafIndex:", inputNote.leafIndex);
+
+    // Get the epoch tree for the input note
+    const epochTree = this.epochManager.getTree(inputNote.epoch);
+    if (!epochTree) {
+      throw new Error(`No tree available for epoch ${inputNote.epoch}`);
+    }
+
+    // Resolve prover artifacts
     const withdrawArtifacts = await this.configuredArtifacts("withdraw");
 
-    // Build withdraw transaction (no change notes in current implementation)
+    // Build withdraw transaction
     const tx = await this.txBuilder.buildWithdraw(
       inputNote,
-      amount,
-      recipient,
       this.spendingKeys,
-      this.merkleTree,
+      recipient,
+      amount,
+      epochTree,
       withdrawArtifacts,
-      { merkleOrder: this.config?.merkleOrder || "bottom-up" }
+      { merkleOrder: this.config?.merkleOrder || "bottom-up" },
     );
 
     // Sign and send
     const signature = await this.provider.sendAndConfirm(
       tx,
-      this.payer ? [this.payer] : []
+      this.payer ? [this.payer] : [],
     );
 
     // Mark input note as spent
@@ -398,8 +471,8 @@ export class ShieldedPoolClient {
       throw new Error("Spending keys not initialized");
     }
 
-    // Always sync before proving to avoid stale roots, even in testMode.
-    await this.merkleTree.sync();
+    // Always sync before proving to avoid stale roots
+    await this.epochManager.sync();
 
     // Decode recipient address to get their spending key
     const recipientSpendingKey =
@@ -415,30 +488,34 @@ export class ShieldedPoolClient {
         error.message.includes("Insufficient note count")
       ) {
         throw new Error(
-          "Shielded transfers require at least two spendable notes. Create another note (e.g. deposit again or split a note) before transferring."
+          "Shielded transfers require at least two spendable notes. Create another note (e.g. deposit again or split a note) before transferring.",
         );
       }
       throw error;
     }
     const inputAmount = inputNotes.reduce((sum, note) => sum + note.value, 0n);
 
-    // All inputs must carry a leaf index for merkle proofs
-    const missingLeaf = inputNotes.find((n) => n.leafIndex === undefined);
-    if (missingLeaf) {
-      throw new Error("Input note missing leaf index; resync and retry");
+    // All inputs must carry epoch and leaf index for merkle proofs
+    const missingInfo = inputNotes.find(
+      (n) => n.leafIndex === undefined || n.epoch === undefined,
+    );
+    if (missingInfo) {
+      throw new Error(
+        "Input note missing epoch or leaf index; resync and retry",
+      );
     }
 
     // Calculate change
     const change = inputAmount - amount;
 
-    // Create output notes
+    // Create output notes (go to current epoch)
     const outputNotes: Note[] = [];
     let changeNote: Note | undefined;
 
     // Note to recipient
     const recipientNote = await this.noteManager.createNote(
       amount,
-      recipientSpendingKey
+      recipientSpendingKey,
     );
     outputNotes.push(recipientNote);
 
@@ -446,7 +523,7 @@ export class ShieldedPoolClient {
     if (change > 0n) {
       changeNote = await this.noteManager.createNote(
         change,
-        this.spendingKeys.spendingKey
+        this.spendingKeys.spendingKey,
       );
       outputNotes.push(changeNote);
     }
@@ -455,19 +532,19 @@ export class ShieldedPoolClient {
     // Keep a snapshot for tests/off-chain delivery
     this.lastOutputNotes = outputNotes.map((n) => ({ ...n }));
 
-    // Build transfer transaction
+    // Build transfer transaction using epoch manager
     const tx = await this.txBuilder.buildTransfer(
       inputNotes,
       outputNotes,
       this.spendingKeys,
-      this.merkleTree,
-      transferArtifacts
+      this.epochManager,
+      transferArtifacts,
     );
 
     // Sign and send
     const signature = await this.provider.sendAndConfirm(
       tx,
-      this.payer ? [this.payer] : []
+      this.payer ? [this.payer] : [],
     );
 
     // Mark input notes as spent
@@ -476,48 +553,204 @@ export class ShieldedPoolClient {
     }
 
     // Add output notes (change only - recipient's note won't be ours)
-    if (change > 0n) {
-      this.noteManager.addPendingNote(outputNotes[1]); // Change note
+    if (change > 0n && changeNote) {
+      this.noteManager.addPendingNote(changeNote);
 
       // In test mode, immediately promote change note to confirmed
       if (this.config?.testMode) {
-        const poolConfigAccount = await (
-          this.program.account as any
-        ).poolConfig.fetch(this.poolConfig);
-        const mint = poolConfigAccount.mint;
-        const [poolTreePDA] = PublicKey.findProgramAddressSync(
-          [Buffer.from("tree"), mint.toBuffer()],
-          this.programId
-        );
-        const poolTree = await (this.program.account as any).poolTree.fetch(
-          poolTreePDA
-        );
-        // Transfer creates output notes, so they get sequential leafIndexes starting from nextIndex
-        const nextIndex = Number(poolTree.nextIndex);
-        // Recipient note is first, change note is second
-        const changeNote = outputNotes[1];
-        changeNote.leafIndex = nextIndex - 1; // Change note gets the last index
+        const epochTree = await this.fetchCurrentEpochTree();
+        const nextIndex = Number(epochTree.nextIndex);
+        changeNote.epoch = this.currentEpoch;
+        changeNote.leafIndex = nextIndex - 1;
         this.noteManager.addNote(changeNote);
       }
     }
 
     if (!this.config?.testMode) {
       await this.scanner.rescanSignature(signature);
-      await this.merkleTree.sync();
+      await this.epochManager.sync();
 
-      // If we produced a change note, assign its leaf index based on the latest tree state.
-      if (change > 0n && changeNote && changeNote.leafIndex === undefined) {
-        const foundIndex = this.merkleTree.findLeafIndex(changeNote.commitment);
-        const nextIndex = await this.merkleTree.getNextIndex();
-        changeNote.leafIndex =
-          foundIndex !== undefined ? foundIndex : nextIndex - 1; // fallback to last leaf if not found
-        this.noteManager.addNote(changeNote);
+      // If we produced a change note, recompute its nullifier with real epoch/leafIndex
+      if (change > 0n && changeNote) {
+        await this.noteManager.recomputeNullifier(changeNote);
       }
     }
 
-    // In non-test mode, let the scanner promote the change note with the correct leaf index.
+    return signature;
+  }
+
+  // ============================================================
+  // EPOCH LIFECYCLE OPERATIONS
+  // ============================================================
+
+  /**
+   * Renew notes that are expiring (migrate to current epoch)
+   * Returns number of notes renewed and their total value
+   */
+  async renewExpiringNotes(maxNotes: number = 10): Promise<{
+    renewed: number;
+    value: bigint;
+    signatures: string[];
+  }> {
+    this.ensureInitialized();
+
+    if (!this.spendingKeys) {
+      throw new Error("Spending keys not initialized");
+    }
+
+    const notesToRenew = this.noteManager.selectNotesForRenewal(maxNotes);
+    if (notesToRenew.length === 0) {
+      return { renewed: 0, value: 0n, signatures: [] };
+    }
+
+    const signatures: string[] = [];
+    let totalValue = 0n;
+
+    const renewArtifacts = await this.configuredArtifacts("renew");
+
+    for (const oldNote of notesToRenew) {
+      try {
+        // Create new note with same value for current epoch
+        const newNote = await this.noteManager.createNote(
+          oldNote.value,
+          this.spendingKeys.spendingKey,
+        );
+        newNote.epoch = this.currentEpoch;
+
+        // Build renew transaction
+        const tx = await this.txBuilder.buildRenew(
+          oldNote,
+          newNote,
+          this.spendingKeys,
+          this.epochManager,
+          renewArtifacts,
+        );
+
+        // Send transaction
+        const signature = await this.provider.sendAndConfirm(
+          tx,
+          this.payer ? [this.payer] : [],
+        );
+
+        // Mark old note as spent, add new note
+        this.noteManager.markSpent(oldNote.commitment);
+        this.noteManager.addPendingNote(newNote);
+
+        if (!this.config?.testMode) {
+          await this.scanner.rescanSignature(signature);
+        }
+
+        signatures.push(signature);
+        totalValue += oldNote.value;
+      } catch (error) {
+        console.error(`Failed to renew note:`, error);
+      }
+    }
+
+    await this.epochManager.sync();
+    return { renewed: signatures.length, value: totalValue, signatures };
+  }
+
+  /**
+   * Trigger epoch rollover (permissionless)
+   * Returns the new epoch number
+   */
+  async rolloverEpoch(): Promise<bigint> {
+    this.ensureInitialized();
+
+    if (!this.payer) {
+      throw new Error("Payer required for epoch rollover");
+    }
+
+    const newEpoch = this.currentEpoch + 1n;
+    const tx = await this.txBuilder.buildRolloverEpoch(
+      this.payer.publicKey,
+      newEpoch,
+    );
+
+    await this.provider.sendAndConfirm(tx, [this.payer]);
+
+    // Update local state
+    this.currentEpoch = newEpoch;
+    this.noteManager.setCurrentEpoch(newEpoch);
+    await this.epochManager.sync();
+
+    return newEpoch;
+  }
+
+  /**
+   * Finalize an epoch (permissionless)
+   */
+  async finalizeEpoch(epoch: bigint): Promise<string> {
+    this.ensureInitialized();
+
+    if (!this.payer) {
+      throw new Error("Payer required for epoch finalization");
+    }
+
+    const tx = await this.txBuilder.buildFinalizeEpoch(
+      this.payer.publicKey,
+      epoch,
+    );
+
+    const signature = await this.provider.sendAndConfirm(tx, [this.payer]);
+    await this.epochManager.sync();
 
     return signature;
+  }
+
+  /**
+   * Garbage collect an expired epoch (permissionless, earns rent)
+   */
+  async garbageCollect(epoch: bigint): Promise<GarbageCollectInfo> {
+    this.ensureInitialized();
+
+    if (!this.payer) {
+      throw new Error("Payer required for garbage collection");
+    }
+
+    const { transaction, gcInfo } = await this.txBuilder.buildGarbageCollect(
+      this.payer.publicKey,
+      epoch,
+    );
+
+    await this.provider.sendAndConfirm(transaction, [this.payer]);
+
+    return gcInfo!;
+  }
+
+  /**
+   * Find expired epochs that can be garbage collected
+   */
+  async findGarbageCollectableEpochs(): Promise<GarbageCollectInfo> {
+    this.ensureInitialized();
+
+    // This would query the chain for expired epochs
+    // For now, return empty info
+    return {
+      epochsAvailable: [],
+      estimatedRentRecovery: 0n,
+      accountsToClose: 0,
+    };
+  }
+
+  // ============================================================
+  // HELPER METHODS
+  // ============================================================
+
+  /**
+   * Fetch current epoch tree data from chain
+   */
+  private async fetchCurrentEpochTree(): Promise<any> {
+    const epochBytes = Buffer.alloc(8);
+    epochBytes.writeBigUInt64LE(this.currentEpoch);
+
+    const [epochTreePda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("epoch_tree"), this.poolConfig.toBuffer(), epochBytes],
+      this.programId,
+    );
+
+    return (this.program.account as any).epochTree.fetch(epochTreePda);
   }
 
   /**
@@ -537,7 +770,7 @@ export class ShieldedPoolClient {
   private ensureInitialized(): void {
     if (!this.isInitialized) {
       throw new Error(
-        "Client not initialized. Call init() first or use static create methods."
+        "Client not initialized. Call init() first or use static create methods.",
       );
     }
   }
@@ -545,7 +778,7 @@ export class ShieldedPoolClient {
   /**
    * Resolve prover artifacts for a given circuit, honoring optional baseDir overrides.
    */
-  private async configuredArtifacts(kind: "withdraw" | "transfer") {
+  private async configuredArtifacts(kind: "withdraw" | "transfer" | "renew") {
     const baseDir = (this as any).config?.artifactsBaseDir;
     const defaults = PROVER_ARTIFACTS[kind];
 
@@ -561,7 +794,7 @@ export class ShieldedPoolClient {
         console.warn(
           `Artifacts load failed from baseDir ${baseDir}:`,
           (e as Error).message,
-          "- falling back to defaults"
+          "- falling back to defaults",
         );
         return defaults;
       }
