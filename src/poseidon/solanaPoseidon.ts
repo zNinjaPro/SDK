@@ -166,9 +166,9 @@ function poseidon(inputs: bigint[], params: PoseidonTable): bigint {
 }
 
 export function poseidonHashBytes(inputs: Uint8Array[]): Uint8Array {
-  if (inputs.length < 1 || inputs.length > 3) {
+  if (inputs.length < 1 || inputs.length > 4) {
     throw new Error(
-      `poseidonHashBytes supports 1-3 inputs, received ${inputs.length}`
+      `poseidonHashBytes supports 1-4 inputs, received ${inputs.length}`
     );
   }
   const width = inputs.length + 1;
@@ -183,9 +183,9 @@ export function poseidonHashBytes(inputs: Uint8Array[]): Uint8Array {
 }
 
 export function poseidonHashField(inputs: Uint8Array[]): bigint {
-  if (inputs.length < 1 || inputs.length > 3) {
+  if (inputs.length < 1 || inputs.length > 4) {
     throw new Error(
-      `poseidonHashField supports 1-3 inputs, received ${inputs.length}`
+      `poseidonHashField supports 1-4 inputs, received ${inputs.length}`
     );
   }
   const width = inputs.length + 1;
