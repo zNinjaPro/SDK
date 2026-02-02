@@ -1,0 +1,26 @@
+{
+  "description": "Test mnemonic phrases for deterministic testing",
+  "warning": "NEVER use these mnemonics for real funds - they are public test vectors",
+  "testCases": [
+    {
+      "name": "standard_test_mnemonic",
+      "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+      "purpose": "Standard BIP39 test vector, used for cross-platform validation"
+    },
+    {
+      "name": "alice_test_mnemonic",
+      "mnemonic": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+      "purpose": "Alice test account for E2E transfer tests"
+    },
+    {
+      "name": "bob_test_mnemonic",
+      "mnemonic": "legal winner thank year wave sausage worth useful legal winner thank yellow",
+      "purpose": "Bob test account for E2E transfer tests"
+    },
+    {
+      "name": "random_test_1",
+      "mnemonic": "void come effort suffer camp survey warrior heavy shoot primary clutch crush open amazing screen patrol group space point ten exist slush involve unfold",
+      "purpose": "24-word test mnemonic for additional entropy tests"
+    }
+  ]
+}

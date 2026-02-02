@@ -7,9 +7,9 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "test": "mocha -r ts-node/register tests/unit.test.ts tests/crypto.test.ts tests/merkle.zeros.test.ts tests/poseidon.variant.test.ts tests/prover.merkleOrder.test.ts tests/txBuilder.pda.test.ts --timeout 60000 --exit",
+    "test": "mocha -r ts-node/register tests/unit.test.ts tests/crypto.test.ts tests/burn.test.ts tests/merkle.zeros.test.ts tests/poseidon.variant.test.ts tests/prover.merkleOrder.test.ts tests/txBuilder.pda.test.ts --timeout 60000 --exit",
     "test:all": "mocha -r ts-node/register tests/**/*.test.ts --timeout 60000 --exit",
-    "test:unit": "mocha -r ts-node/register tests/unit.test.ts --exit",
+    "test:unit": "mocha -r ts-node/register tests/unit.test.ts tests/burn.test.ts --exit",
     "test:e2e": "mocha -r ts-node/register tests/e2e.test.ts --timeout 120000 --exit",
     "test:e2e:fast": "mocha -r ts-node/register tests/e2e_fast.test.ts --timeout 120000 --exit",
     "e2e:validator": "./scripts/start-validator.sh --quiet",

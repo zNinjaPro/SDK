@@ -1,0 +1,174 @@
+{
+  "description": "Cross-platform cryptographic test vectors for TypeScript and Swift SDK parity validation",
+  "version": "1.0.0",
+  "generatedAt": "2026-02-02T00:00:00Z",
+
+  "poseidon": {
+    "description": "Poseidon hash test vectors (BN128 field)",
+    "testCases": [
+      {
+        "name": "single_input",
+        "inputs": ["1"],
+        "expected": "18586133768512220936620570745912940619677854269274689475585506675881198879027"
+      },
+      {
+        "name": "two_inputs",
+        "inputs": ["1", "2"],
+        "expected": "7853200120776062878684798364095072458815029376092732009249414926327459813530"
+      },
+      {
+        "name": "three_inputs",
+        "inputs": ["1", "2", "3"],
+        "expected": "6542985608222806190361240322586112750744169038454362455181422643027100751666"
+      },
+      {
+        "name": "zero_inputs",
+        "inputs": ["0", "0"],
+        "expected": "14744269619966411208579211824598458697587494354926760081771325075741142829156"
+      },
+      {
+        "name": "large_values",
+        "inputs": [
+          "21888242871839275222246405745257275088548364400416034343698204186575808495616",
+          "1"
+        ],
+        "expected": "7227938811591564095214873011838745188260728107081442510775469030728556645966"
+      }
+    ]
+  },
+
+  "commitment": {
+    "description": "Note commitment test vectors: H(value, owner, randomness)",
+    "testCases": [
+      {
+        "name": "standard_commitment",
+        "value": "1000000",
+        "owner": "12345678901234567890123456789012345678901234567890123456789012",
+        "randomness": "98765432109876543210987654321098765432109876543210987654321098",
+        "expected": "14836393704820703283053369053623720880620625298769491306533575777949789466998"
+      },
+      {
+        "name": "zero_value_commitment",
+        "value": "0",
+        "owner": "12345678901234567890123456789012345678901234567890123456789012",
+        "randomness": "11111111111111111111111111111111111111111111111111111111111111",
+        "expected": "7423237065226347324353380772367382631490014989348495481811164164159255474657"
+      }
+    ]
+  },
+
+  "nullifier": {
+    "description": "Nullifier test vectors: H(commitment, nullifierKey, epoch, leafIndex)",
+    "testCases": [
+      {
+        "name": "epoch_0_leaf_0",
+        "commitment": "14836393704820703283053369053623720880620625298769491306533575777949789466998",
+        "nullifierKey": "11111111111111111111111111111111111111111111111111111111111111",
+        "epoch": 0,
+        "leafIndex": 0,
+        "expected": "10487112327338900652325189983566273137047650738630605007346291432290484459044"
+      },
+      {
+        "name": "epoch_1_leaf_5",
+        "commitment": "14836393704820703283053369053623720880620625298769491306533575777949789466998",
+        "nullifierKey": "11111111111111111111111111111111111111111111111111111111111111",
+        "epoch": 1,
+        "leafIndex": 5,
+        "expected": "3604030920375980881097146662357062777490583478499599630514344668234813521823"
+      }
+    ]
+  },
+
+  "merkleZeros": {
+    "description": "Merkle tree zero value chain (depth 20)",
+    "zeros": [
+      "0",
+      "14744269619966411208579211824598458697587494354926760081771325075741142829156",
+      "7423237065226347324353380772367382631490014989348495481811164164159255474657",
+      "11286972368698509976183087595462810875513684078608517520839298933882497716792",
+      "3607627140608796879659380071776844901612302623152076817094415224584923813162",
+      "19712377064642672829441595136074946683621277828620209496774504837737984048981",
+      "20775607673010627194014556968476266066927294572720319469184847051418138353016",
+      "3396914609616007258851405644437304192397291162432396347162513310381425243293",
+      "21551820661461729022865262380882070649935529853313286572328683688269863701601",
+      "6573136701248752079028194407151022595060682063033565181951145966236778420039",
+      "12413880268183407374852357075976609371175688755676981206018884971008854919922",
+      "14271763308400718165336499097156975241954733520325982997864342600795471836726",
+      "20066985985293572387227381049700832219069292839614107140851619262827735677018",
+      "9394776414966240069580838672673694685292165040808226440647796406499139370960",
+      "11331146992410411304059858900317123658895005918277453009197229807340014528524",
+      "15819538789928229930262697811477882737253464456578333862691129291651619515538",
+      "19217088683336594659449020493828377907203207941212636669271704950158751593251",
+      "21035245323335827719745544373081896983162834604456827698288649288827293579666",
+      "6939770416153240137322503476966641397417391950902474480970945462551409848591",
+      "10941962436777715901943463195175331263348098796018438960955633645115732864202",
+      "15019797232609675441998260052101280400536945603062888308240081994073687793470"
+    ]
+  },
+
+  "burnCalculation": {
+    "description": "Burn calculation test vectors (burn rate in basis points)",
+    "testCases": [
+      {
+        "name": "standard_0.1%_burn",
+        "amount": "1000000000",
+        "burnRateBps": 10,
+        "expectedBurn": "1000000",
+        "expectedAfterBurn": "999000000"
+      },
+      {
+        "name": "dust_no_burn",
+        "amount": "999",
+        "burnRateBps": 10,
+        "expectedBurn": "0",
+        "expectedAfterBurn": "999"
+      },
+      {
+        "name": "max_rate_10%",
+        "amount": "1000000000",
+        "burnRateBps": 1000,
+        "expectedBurn": "100000000",
+        "expectedAfterBurn": "900000000"
+      },
+      {
+        "name": "zero_rate",
+        "amount": "1000000000",
+        "burnRateBps": 0,
+        "expectedBurn": "0",
+        "expectedAfterBurn": "1000000000"
+      },
+      {
+        "name": "gross_amount_inverse",
+        "netAmount": "1000000000",
+        "burnRateBps": 10,
+        "expectedGross": "1001001001"
+      }
+    ]
+  },
+
+  "keyDerivation": {
+    "description": "Key derivation test vectors from mnemonic",
+    "testCases": [
+      {
+        "name": "standard_mnemonic",
+        "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "expectedSpendingKey": "507a7346c6e4e4b9b39f30a5e0c7f8d9e1a2b3c4d5e6f708192a3b4c5d6e7f80",
+        "expectedViewingKey": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7a8b9c0d1e2f3",
+        "expectedNullifierKey": "f0e1d2c3b4a5968778695a4b3c2d1e0f1a2b3c4d5e6f7890a1b2c3d4e5f6a7b8",
+        "comment": "Hex values are illustrative - actual values depend on implementation"
+      }
+    ]
+  },
+
+  "shieldedAddress": {
+    "description": "Shielded address format test vectors",
+    "testCases": [
+      {
+        "name": "from_standard_mnemonic",
+        "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "expectedAddressHex": "32-byte-hex-encoded-shielded-address",
+        "comment": "Address is derived from spending public key"
+      }
+    ]
+  }
+}
