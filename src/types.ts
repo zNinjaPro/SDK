@@ -36,6 +36,52 @@ export const DEFAULT_EPOCH_EXPIRY_SLOTS = 38_880_000n;
 /** Default finalization delay after epoch ends (~1 day) */
 export const DEFAULT_FINALIZATION_DELAY_SLOTS = 216_000n;
 
+/** Default burn rate in basis points (10 = 0.1%) */
+export const DEFAULT_BURN_RATE_BPS = 10;
+
+/**
+ * Calculate the burn amount for a given transaction amount
+ * @param amount - The transaction amount (deposit or withdraw)
+ * @param burnRateBps - Burn rate in basis points (10 = 0.1%)
+ * @returns The amount that will be burned
+ */
+export function calculateBurnAmount(
+  amount: bigint,
+  burnRateBps: number,
+): bigint {
+  return (amount * BigInt(burnRateBps)) / 10000n;
+}
+
+/**
+ * Calculate the amount after burn (what the user actually receives/credits)
+ * @param amount - The transaction amount (deposit or withdraw)
+ * @param burnRateBps - Burn rate in basis points (10 = 0.1%)
+ * @returns The amount after burn is deducted
+ */
+export function calculateAmountAfterBurn(
+  amount: bigint,
+  burnRateBps: number,
+): bigint {
+  const burnAmount = calculateBurnAmount(amount, burnRateBps);
+  return amount - burnAmount;
+}
+
+/**
+ * Calculate the gross amount needed to receive a specific net amount after burn
+ * @param netAmount - The desired net amount after burn
+ * @param burnRateBps - Burn rate in basis points (10 = 0.1%)
+ * @returns The gross amount needed (before burn)
+ */
+export function calculateGrossAmount(
+  netAmount: bigint,
+  burnRateBps: number,
+): bigint {
+  // netAmount = grossAmount - (grossAmount * burnRate / 10000)
+  // netAmount = grossAmount * (10000 - burnRate) / 10000
+  // grossAmount = netAmount * 10000 / (10000 - burnRate)
+  return (netAmount * 10000n) / BigInt(10000 - burnRateBps);
+}
+
 /**
  * Epoch state enum matching on-chain representation
  */
@@ -197,6 +243,12 @@ export interface PoolConfig {
 
   /** Whether pool is paused */
   paused: boolean;
+
+  /** Burn rate in basis points (10 = 0.1%) */
+  burnRateBps: number;
+
+  /** Total tokens burned across all transactions */
+  totalBurned: bigint;
 }
 
 /**
