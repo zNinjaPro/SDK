@@ -26,6 +26,11 @@ import {
   decryptNote,
 } from "./crypto";
 import { EPOCH_TIMING } from "./config";
+import {
+  NoteStore,
+  serializeStoreData,
+  deserializeStoreData,
+} from "./noteStore";
 
 /**
  * Warning threshold for expiring notes (2 epochs before expiration)
@@ -41,11 +46,86 @@ export class NoteManager {
   private spendingKeys?: SpendingKeys;
   private currentEpoch: bigint = 0n;
   private epochExpirySlots: bigint;
+  private noteStore?: NoteStore;
+  private persistTimeout?: ReturnType<typeof setTimeout>;
 
-  constructor(spendingKeys?: SpendingKeys, epochExpirySlots?: bigint) {
+  constructor(
+    spendingKeys?: SpendingKeys,
+    epochExpirySlots?: bigint,
+    noteStore?: NoteStore,
+  ) {
     this.spendingKeys = spendingKeys;
     this.epochExpirySlots =
       epochExpirySlots ?? EPOCH_TIMING.DEFAULT_EXPIRY_SLOTS;
+    this.noteStore = noteStore;
+  }
+
+  // ─── Persistence ─────────────────────────────────────────────
+
+  /**
+   * Load notes from the configured store.
+   * Returns true if data was restored, false otherwise.
+   */
+  async loadFromStore(): Promise<boolean> {
+    if (!this.noteStore) return false;
+    const data = await this.noteStore.load();
+    if (!data) return false;
+    const { notes, pendingNotes, currentEpoch } = deserializeStoreData(data);
+    this.notes = notes;
+    this.pendingNotes = pendingNotes;
+    this.currentEpoch = currentEpoch;
+    return true;
+  }
+
+  /**
+   * Debounced persistence — coalesces rapid mutations into a single write.
+   */
+  private schedulePersist(): void {
+    if (!this.noteStore) return;
+    if (this.persistTimeout) clearTimeout(this.persistTimeout);
+    this.persistTimeout = setTimeout(() => this.persistNow(), 100);
+  }
+
+  /**
+   * Force-persist current note state to the configured store immediately.
+   */
+  async persistNow(): Promise<void> {
+    if (!this.noteStore) return;
+    if (this.persistTimeout) {
+      clearTimeout(this.persistTimeout);
+      this.persistTimeout = undefined;
+    }
+    const data = serializeStoreData(
+      this.notes,
+      this.pendingNotes,
+      this.currentEpoch,
+    );
+    await this.noteStore.save(data);
+  }
+
+  /**
+   * Clear all persisted data from the store.
+   */
+  async clearStore(): Promise<void> {
+    if (!this.noteStore) return;
+    await this.noteStore.clear();
+  }
+
+  /**
+   * Get summary statistics about the note set.
+   */
+  getStats(): {
+    confirmed: number;
+    pending: number;
+    spent: number;
+    total: bigint;
+  } {
+    return {
+      confirmed: this.notes.filter((n) => !n.spent).length,
+      pending: this.pendingNotes.length,
+      spent: this.notes.filter((n) => n.spent).length,
+      total: this.calculateBalance(),
+    };
   }
 
   /**
@@ -53,6 +133,7 @@ export class NoteManager {
    */
   setCurrentEpoch(epoch: bigint): void {
     this.currentEpoch = epoch;
+    this.schedulePersist();
   }
 
   /**
@@ -85,6 +166,7 @@ export class NoteManager {
     this.pendingNotes = this.pendingNotes.filter(
       (n) => !arraysEqual(n.commitment, note.commitment),
     );
+    this.schedulePersist();
   }
 
   /**
@@ -97,6 +179,7 @@ export class NoteManager {
       return;
     }
     this.pendingNotes.push(note);
+    this.schedulePersist();
   }
 
   /**
@@ -164,6 +247,7 @@ export class NoteManager {
     for (const note of this.notes) {
       if (arraysEqual(note.commitment, commitment)) {
         note.spent = true;
+        this.schedulePersist();
         break;
       }
     }
@@ -184,6 +268,7 @@ export class NoteManager {
 
       if (arraysEqual(note.nullifier, nullifierArray)) {
         note.spent = true;
+        this.schedulePersist();
         break;
       }
     }
@@ -199,18 +284,7 @@ export class NoteManager {
     token?: PublicKey,
   ): Promise<Note> {
     const randomness = randomBytes(32);
-    console.log(
-      "🔨 Creating note: value=",
-      value.toString(),
-      ", owner_len=",
-      owner.length,
-    );
     const commitment = await computeCommitment(value, owner, randomness);
-    console.log("🔨 Commitment computed, length=", commitment.length);
-    console.log(
-      "🔨 Commitment (hex):",
-      Buffer.from(commitment).toString("hex").slice(0, 64),
-    );
 
     // Note: Nullifier will be recomputed with epoch and leafIndex once confirmed
     // For now, compute a placeholder with current epoch and index 0

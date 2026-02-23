@@ -348,7 +348,6 @@ export class EpochMerkleTreeManager {
    * Sync a specific epoch's tree from chain
    */
   async syncEpoch(epoch: bigint): Promise<EpochMerkleTree> {
-    console.log(`🌲 Syncing epoch ${epoch} merkle tree from chain...`);
 
     // Derive epoch tree PDA
     const epochBytes = Buffer.alloc(8);
@@ -369,7 +368,6 @@ export class EpochMerkleTreeManager {
         epochTreePDA,
       );
     } catch (e) {
-      console.log(`   Epoch ${epoch} tree not found on chain`);
       return this.getTree(epoch);
     }
 
@@ -386,18 +384,13 @@ export class EpochMerkleTreeManager {
     }
 
     const nextIndex = Number(epochTreeAccount.nextIndex);
-    console.log(
-      `   Epoch ${epoch}: state=${EpochState[tree.getState()]}, nextIndex=${nextIndex}`,
-    );
 
     if (nextIndex === 0) {
-      console.log(`   Epoch ${epoch} tree is empty`);
       return tree;
     }
 
     // Fetch leaf chunks
     const numChunks = Math.ceil(nextIndex / LEAF_CHUNK_SIZE);
-    console.log(`   Fetching ${numChunks} leaf chunks...`);
 
     const chunkPromises = Array.from({ length: numChunks }, (_, i) =>
       this.fetchLeafChunk(epoch, i),
@@ -415,7 +408,6 @@ export class EpochMerkleTreeManager {
     }
     tree.insertMany(allLeaves);
 
-    console.log(`✅ Synced ${allLeaves.length} leaves for epoch ${epoch}`);
     return tree;
   }
 
@@ -424,7 +416,6 @@ export class EpochMerkleTreeManager {
    */
   async syncAll(): Promise<void> {
     await this.fetchCurrentEpoch();
-    console.log(`📅 Current epoch: ${this.currentEpoch}`);
 
     // Sync current epoch and a few previous ones
     const epochsToSync: bigint[] = [];

@@ -34,6 +34,7 @@ import {
 } from "./types";
 import { PROVER_ARTIFACTS, EPOCH_TIMING } from "./config";
 import { poseidonHash } from "./crypto";
+import { NoteStore, EncryptedFileStore } from "./noteStore";
 
 export interface ShieldedPoolClientConfig {
   connection: Connection;
@@ -44,6 +45,9 @@ export interface ShieldedPoolClientConfig {
   artifactsBaseDir?: string; // optional base dir for proving artifacts
   merkleOrder?: "top-down" | "bottom-up"; // control merkle path ordering for circuits
   testMode?: boolean; // when true, skip scanner/rescan and include pending in balances
+  historyScanLimit?: number; // max number of historical transactions to scan (default: 100)
+  noteStore?: NoteStore; // custom NoteStore implementation
+  noteStorePath?: string; // convenience: auto-create EncryptedFileStore at this path
 }
 import { loadArtifacts } from "./prover";
 
@@ -118,6 +122,7 @@ export class ShieldedPoolClient {
       this.connection,
       this.program,
       this.poolConfig,
+      { historyScanLimit: config.historyScanLimit },
     );
     this.txBuilder = new TransactionBuilder(
       this.program,
@@ -172,7 +177,6 @@ export class ShieldedPoolClient {
 
     // Initialize Poseidon for merkle tree hashing (call once to load library)
     await poseidonHash([new Uint8Array(32)]);
-    console.log("✅ Poseidon initialized");
 
     // Get spending keys
     this.spendingKeys = {
@@ -183,8 +187,21 @@ export class ShieldedPoolClient {
       shieldedAddress: this.keyManager.getShieldedAddress(),
     };
 
-    // Configure note manager with keys
-    this.noteManager = new NoteManager(this.spendingKeys);
+    // Configure note manager with persistence
+    let store: NoteStore | undefined = this.config.noteStore;
+    if (!store && this.config.noteStorePath) {
+      store = new EncryptedFileStore(
+        this.config.noteStorePath,
+        this.spendingKeys.viewingKey,
+      );
+    }
+    this.noteManager = new NoteManager(this.spendingKeys, undefined, store);
+
+    // Restore notes from store if available
+    const restored = await this.noteManager.loadFromStore();
+    if (restored) {
+      const stats = this.noteManager.getStats();
+    }
 
     // Sync epoch manager from chain; in testMode tolerate missing poolConfig
     try {
@@ -193,10 +210,6 @@ export class ShieldedPoolClient {
       this.noteManager.setCurrentEpoch(this.currentEpoch);
     } catch (e) {
       if (this.config?.testMode) {
-        console.warn(
-          "⚠️ Epoch sync skipped in testMode:",
-          (e as Error).message,
-        );
       } else {
         throw e;
       }
@@ -358,11 +371,7 @@ export class ShieldedPoolClient {
 
     // Debug: Check what notes we have
     const allNotes = this.noteManager.getNotes();
-    console.log("📋 Notes after deposit:");
     allNotes.forEach((n, i) => {
-      console.log(
-        `   Note ${i}: value=${n.value}, epoch=${n.epoch}, leafIndex=${n.leafIndex}`,
-      );
     });
 
     return signature;
@@ -424,10 +433,6 @@ export class ShieldedPoolClient {
       );
     }
 
-    console.log("📝 Selected note for withdrawal:");
-    console.log("   Value:", inputNote.value.toString());
-    console.log("   Epoch:", inputNote.epoch.toString());
-    console.log("   LeafIndex:", inputNote.leafIndex);
 
     // Get the epoch tree for the input note
     const epochTree = this.epochManager.getTree(inputNote.epoch);
@@ -643,7 +648,6 @@ export class ShieldedPoolClient {
         signatures.push(signature);
         totalValue += oldNote.value;
       } catch (error) {
-        console.error(`Failed to renew note:`, error);
       }
     }
 
@@ -760,7 +764,6 @@ export class ShieldedPoolClient {
     try {
       await this.scanner.stop();
     } catch (err) {
-      console.warn("ShieldedPoolClient.stop(): scanner stop failed", err);
     }
   }
 
@@ -775,11 +778,59 @@ export class ShieldedPoolClient {
     }
   }
 
+  // ─── Note persistence ──────────────────────────────────────────
+
+  /**
+   * Force-persist current note state to the configured store.
+   * No-op if no store is configured.
+   */
+  async saveNotes(): Promise<void> {
+    await this.noteManager.persistNow();
+  }
+
+  /**
+   * Clear all persisted note data from the configured store.
+   */
+  async clearNotes(): Promise<void> {
+    await this.noteManager.clearStore();
+  }
+
+  /**
+   * Full wallet recovery: scan all on-chain events and rebuild note state.
+   * This is expensive — only use when the note store is lost or corrupted.
+   * @param scanLimit Maximum number of transactions to scan (default: 1000)
+   */
+  async recoverFromChain(
+    scanLimit: number = 1000,
+  ): Promise<{ found: number; spent: number }> {
+    this.ensureInitialized();
+
+    // Clear existing notes
+    this.noteManager = new NoteManager(
+      this.spendingKeys,
+      undefined,
+      (this.noteManager as any).noteStore, // preserve store reference
+    );
+
+    // Scan with extended history limit
+    const originalLimit = this.scanner.getHistoryScanLimit();
+    this.scanner.setHistoryScanLimit(scanLimit);
+    await this.scanner.start(this.spendingKeys!.viewingKey, this.noteManager);
+    await this.scanner.scanHistory();
+    this.scanner.setHistoryScanLimit(originalLimit);
+
+    // Persist recovered notes
+    await this.noteManager.persistNow();
+
+    const stats = this.noteManager.getStats();
+    return { found: stats.confirmed, spent: stats.spent };
+  }
+
   /**
    * Resolve prover artifacts for a given circuit, honoring optional baseDir overrides.
    */
   private async configuredArtifacts(kind: "withdraw" | "transfer" | "renew") {
-    const baseDir = (this as any).config?.artifactsBaseDir;
+    const baseDir = this.config?.artifactsBaseDir;
     const defaults = PROVER_ARTIFACTS[kind];
 
     if (baseDir) {
@@ -791,11 +842,6 @@ export class ShieldedPoolClient {
         });
         return artifacts;
       } catch (e) {
-        console.warn(
-          `Artifacts load failed from baseDir ${baseDir}:`,
-          (e as Error).message,
-          "- falling back to defaults",
-        );
         return defaults;
       }
     }

@@ -4,11 +4,38 @@
 import type { PublicKey } from "@solana/web3.js";
 import type { Note, MerkleProof, SpendingKeys } from "./types";
 import { poseidonHashSync } from "./crypto";
+import { getLogger } from "./logger";
 
 const BN254_PRIME_HEX =
   "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001";
 const BN254_PRIME = BigInt("0x" + BN254_PRIME_HEX);
 const BN254_PRIME_BYTES = Buffer.from(BN254_PRIME_HEX, "hex");
+
+/**
+ * Validate that a bigint value fits within the BN254 scalar field (< prime).
+ * Throws a descriptive error if the value is out of range.
+ */
+function assertInField(value: bigint, label: string): void {
+  if (value < 0n) {
+    throw new Error(`${label} must be non-negative, got ${value}`);
+  }
+  if (value >= BN254_PRIME) {
+    throw new Error(
+      `${label} exceeds BN254 scalar field (got ${value}, max ${BN254_PRIME - 1n})`,
+    );
+  }
+}
+
+/**
+ * Validate that a Uint8Array, interpreted as a big-endian integer, fits within
+ * the BN254 scalar field. Throws if out of range.
+ */
+function assertBytesInField(bytes: Uint8Array, label: string): void {
+  const hex = Buffer.from(bytes).toString("hex");
+  if (hex.length === 0) return; // zero-length → 0, which is in field
+  const value = BigInt("0x" + hex);
+  assertInField(value, label);
+}
 
 function reduceBytesToField(bytes: Uint8Array): number[] {
   const hex = Buffer.from(bytes).toString("hex");
@@ -144,9 +171,6 @@ function toWitnessSignalsWithdraw(
   if (process.env.ZK_TRACE_MERKLE === "1") {
     try {
       let cur = inputs.note.commitment;
-      console.log(
-        `[trace] withdraw merkle start leaf=${Buffer.from(cur).toString("hex").slice(0, 16)} order=${order}`,
-      );
       for (let i = 0; i < chosenProof.length; i++) {
         const sib = chosenProof[i];
         const bit = chosenIndices[i];
@@ -156,18 +180,10 @@ function toWitnessSignalsWithdraw(
           bit === 0
             ? poseidonHashSync([cur, sib])
             : poseidonHashSync([sib, cur]);
-        console.log(
-          `[trace] level=${i} bit=${bit} cur=${before} sib=${sibHex} -> ${Buffer.from(cur).toString("hex").slice(0, 8)}`,
-        );
       }
       const finalHex = Buffer.from(cur).toString("hex");
       const targetHex = Buffer.from(inputs.merkleRoot).toString("hex");
-      console.log(
-        `[trace] withdraw merkle final=${finalHex.slice(0, 16)} target=${targetHex.slice(0, 16)} match=${finalHex === targetHex}`,
-      );
-    } catch (e) {
-      console.warn("[trace] withdraw merkle trace failed", e);
-    }
+    } catch (e) {}
   }
 
   // Helper to convert Buffer to decimal BigInt string
@@ -211,16 +227,7 @@ function toWitnessSignalsWithdraw(
         Buffer.from(inputs.spendingKeys.nullifierKey),
         leafIndexBuf,
       ]);
-      console.log(
-        `[trace] nullifier base=${Buffer.from(nullifierBytes)
-          .toString("hex")
-          .slice(0, 16)} alt=${Buffer.from(altNullifierBytes)
-          .toString("hex")
-          .slice(0, 16)}`,
-      );
-    } catch (e) {
-      console.warn("[trace] nullifier alt compute failed", e);
-    }
+    } catch (e) {}
   }
 
   const txAnchorBytes = inputs.txAnchor ?? new Uint8Array(32);
@@ -294,9 +301,6 @@ function toWitnessSignalsTransfer(inputs: TransferInputs): Record<string, any> {
     if (process.env.ZK_TRACE_MERKLE === "1") {
       try {
         let cur = commitment;
-        console.log(
-          `[trace] transfer merkle start leaf=${Buffer.from(cur).toString("hex").slice(0, 16)} order=${order}`,
-        );
         for (let i = 0; i < proof.length; i++) {
           const sib = proof[i];
           const bit = indices[i];
@@ -306,18 +310,10 @@ function toWitnessSignalsTransfer(inputs: TransferInputs): Record<string, any> {
             bit === 0
               ? poseidonHashSync([cur, sib])
               : poseidonHashSync([sib, cur]);
-          console.log(
-            `[trace] level=${i} bit=${bit} cur=${before} sib=${sibHex} -> ${Buffer.from(cur).toString("hex").slice(0, 8)}`,
-          );
         }
         const finalHex = Buffer.from(cur).toString("hex");
         const targetHex = Buffer.from(mp.root).toString("hex");
-        console.log(
-          `[trace] transfer merkle final=${finalHex.slice(0, 16)} target=${targetHex.slice(0, 16)} match=${finalHex === targetHex}`,
-        );
-      } catch (e) {
-        console.warn("[trace] transfer merkle trace failed", e);
-      }
+      } catch (e) {}
     }
     return { proof, indices };
   };
@@ -424,18 +420,20 @@ export async function proveWithdraw(
   inputs: WithdrawInputs,
   options?: ProverOptions,
 ): Promise<ProverOutput> {
+  // Validate circuit inputs fit within BN254 scalar field
+  assertInField(inputs.amount, "withdraw amount");
+  assertInField(inputs.note.value, "withdraw note.value");
+  assertBytesInField(inputs.note.randomness, "withdraw note.randomness");
+  assertBytesInField(inputs.note.owner, "withdraw note.owner");
+
+  const log = getLogger();
   const debugTrace = process.env.ZK_TRACE_PROVER === "1";
   const t0 = Date.now();
+  log.info("proveWithdraw: starting", {
+    epoch: inputs.epoch.toString(),
+    leafIndex: inputs.leafIndex,
+  });
   if (debugTrace) {
-    console.log("[trace] withdraw inputs", {
-      merkleRoot: Buffer.from(inputs.merkleRoot).toString("hex").slice(0, 16),
-      leafIndex: inputs.merkleProof.leafIndex,
-      siblings: inputs.merkleProof.siblings.length,
-      value: inputs.note.value.toString(),
-      commitment: Buffer.from(inputs.note.commitment)
-        .toString("hex")
-        .slice(0, 16),
-    });
   }
   const txAnchorBytes = inputs.txAnchor ?? new Uint8Array(32);
   const chainIdBytes = inputs.chainId ?? new Uint8Array(32);
@@ -469,7 +467,6 @@ export async function proveWithdraw(
       poolId, // pool_id
       chainId, // chain_id
     ];
-    console.log("⚑ MOCK_PROOFS enabled: skipping witness+proving");
     return { proof: empty, publicInputs };
   }
   const snarkjs = await loadSnarkJS();
@@ -497,7 +494,6 @@ export async function proveWithdraw(
   const tSignals0 = Date.now();
   const signals = toWitnessSignalsWithdraw(inputs, options);
   const tSignals1 = Date.now();
-  console.log(`⏱️ build-signals(ms): ${tSignals1 - tSignals0}`);
 
   // Sanity: compute root from proof and note commitment using SDK Poseidon
   try {
@@ -513,13 +509,7 @@ export async function proveWithdraw(
     const computedLeafHex = Buffer.from(computedLeaf).toString("hex");
     const noteLeafHex = Buffer.from(inputs.note.commitment).toString("hex");
     if (computedLeafHex !== noteLeafHex) {
-      console.warn(
-        "⚠️ Commitment mismatch: computed != note.commitment",
-        computedLeafHex.slice(0, 16) + "...",
-        noteLeafHex.slice(0, 16) + "...",
-      );
     } else {
-      console.log("✅ Commitment matches note.commitment");
     }
 
     let cur = inputs.note.commitment;
@@ -535,34 +525,11 @@ export async function proveWithdraw(
     const sdkRootHex = Buffer.from(cur).toString("hex");
     const providedRootHex = Buffer.from(inputs.merkleRoot).toString("hex");
     if (sdkRootHex !== providedRootHex) {
-      console.warn(
-        "⚠️ SDK-computed root != provided merkleRoot:",
-        sdkRootHex.slice(0, 16) + "...",
-        providedRootHex.slice(0, 16) + "...",
-      );
     } else {
-      console.log("✅ SDK-computed root matches provided merkleRoot");
     }
-  } catch (e) {
-    console.warn("⚠️ Failed to compute SDK root for sanity check:", e);
-  }
+  } catch (e) {}
 
   // Debug: Log witness signals
-  console.log("🔍 Witness signals:");
-  console.log("   merkleRoot:", signals.merkleRoot.slice(0, 20) + "...");
-  console.log("   recipient:", signals.recipient.slice(0, 20) + "...");
-  console.log("   amount:", signals.amount);
-  console.log("   value:", signals.value);
-  console.log("   merkleProof length:", signals.merkleProof.length);
-  console.log(
-    "   merkleProof[0]:",
-    signals.merkleProof[0]?.slice(0, 20) + "...",
-  );
-  console.log(
-    "   merkleProof[1]:",
-    signals.merkleProof[1]?.slice(0, 20) + "...",
-  );
-  console.log("   merkleIndices:", signals.merkleIndices);
 
   // Extra sanity: recompute root using witness strings passed to the circuit
   try {
@@ -589,17 +556,9 @@ export async function proveWithdraw(
       .toString(16)
       .padStart(64, "0");
     if (witnessRootHex !== providedRootHex2) {
-      console.warn(
-        "⚠️ Witness-derived root != provided merkleRoot:",
-        witnessRootHex.slice(0, 16) + "...",
-        providedRootHex2.slice(0, 16) + "...",
-      );
     } else {
-      console.log("✅ Witness-derived root matches provided merkleRoot");
     }
-  } catch (e) {
-    console.warn("⚠️ Failed witness-root recompute:", e);
-  }
+  } catch (e) {}
 
   const { groth16 } = snarkjs;
   const tWitness0 = Date.now();
@@ -622,12 +581,6 @@ export async function proveWithdraw(
       encoding: "utf8",
     });
     if (which.status !== 0 || !which.stdout) {
-      console.error(
-        `rapidsnark binary not found: ${bin}. Set RAPIDSNARK_BIN or install rapidsnark.`,
-      );
-      console.error(
-        "macOS hint: brew tap geometryxyz/snark && brew install rapidsnark (or build from source)",
-      );
       throw new Error("rapidsnark not available on PATH");
     }
     const rs = require("child_process").spawnSync(
@@ -652,9 +605,6 @@ export async function proveWithdraw(
     publicSignals = out.publicSignals;
   }
   const tWitness1 = Date.now();
-  console.log(
-    `⏱️ witness+prove(ms): ${tWitness1 - tWitness0} (rapidsnark=${useRapidsnark})`,
-  );
 
   // Format proof for Solana (256 bytes total)
   const proofBytes = new Uint8Array(256);
@@ -734,13 +684,12 @@ export async function proveWithdraw(
   circuitPublicInputs.forEach((pi, idx) => {
     const ok = inField(Uint8Array.from(pi));
     if (!ok) {
-      console.warn(`⚠️ public input not in BN254 field: ${labels[idx]}`);
     }
   });
 
   const publicInputs = circuitPublicInputs;
   const t1 = Date.now();
-  console.log(`⏱️ withdraw total(ms): ${t1 - t0}`);
+  log.info("proveWithdraw: completed", { elapsedMs: t1 - t0 });
   return { proof: formatted, publicInputs };
 }
 
@@ -760,19 +709,36 @@ export async function proveTransfer(
   inputs: TransferInputs,
   options?: ProverOptions,
 ): Promise<ProverOutput> {
+  // Validate circuit inputs fit within BN254 scalar field
+  for (let i = 0; i < 2; i++) {
+    const note = inputs.inputNotes[i];
+    assertInField(note.value, `transfer inputNotes[${i}].value`);
+    assertBytesInField(note.randomness, `transfer inputNotes[${i}].randomness`);
+    assertBytesInField(note.owner, `transfer inputNotes[${i}].owner`);
+  }
+  for (let i = 0; i < 2; i++) {
+    const note = inputs.outputNotes[i];
+    assertInField(note.value, `transfer outputNotes[${i}].value`);
+    assertBytesInField(
+      note.randomness,
+      `transfer outputNotes[${i}].randomness`,
+    );
+    assertBytesInField(note.owner, `transfer outputNotes[${i}].owner`);
+  }
+
+  const log = getLogger();
   const debugTrace = process.env.ZK_TRACE_PROVER === "1";
   const canonicalEnv = process.env.ZK_TRANSFER_CANONICAL_PIS ?? "1";
   const expectCanonical = canonicalEnv !== "0";
   if (!expectCanonical) {
-    console.warn(
-      "Legacy transfer public inputs are deprecated; forcing canonical layout with tx_anchor/pool_id/chain_id",
-    );
   }
   if (!inputs.poolConfig) {
     throw new Error(
       "poolConfig is required to encode canonical transfer public inputs (pool_id)",
     );
   }
+  const t0 = Date.now();
+  log.info("proveTransfer: starting", { epoch: inputs.epoch.toString() });
   const txAnchorBytes = inputs.txAnchor ?? new Uint8Array(32);
   const chainIdBytes = inputs.chainId ?? new Uint8Array(32);
   const poolIdBytes = Uint8Array.from(
@@ -787,18 +753,6 @@ export async function proveTransfer(
       commitment: Buffer.from(note.commitment).toString("hex").slice(0, 16),
     });
     const order = process.env.ZK_MERKLE_ORDER || "bottom-up";
-    console.log("[trace] transfer inputs", {
-      merkleRoot: Buffer.from(inputs.merkleRoot).toString("hex").slice(0, 16),
-      order,
-      input0: summarizeNote(inputs.inputNotes[0], inputs.merkleProofs[0]),
-      input1: summarizeNote(inputs.inputNotes[1], inputs.merkleProofs[1]),
-      output0: Buffer.from(inputs.outputNotes[0].commitment)
-        .toString("hex")
-        .slice(0, 16),
-      output1: Buffer.from(inputs.outputNotes[1].commitment)
-        .toString("hex")
-        .slice(0, 16),
-    });
   }
   if (process.env.MOCK_PROOFS === "1") {
     const empty: Groth16Proof = {
@@ -819,7 +773,6 @@ export async function proveTransfer(
       Array.from(chainIdBytes),
     );
     const publicInputs = mutInputs;
-    console.log("⚑ MOCK_PROOFS enabled: skipping witness+proving");
     return { proof: empty, publicInputs };
   }
   const snarkjs = await loadSnarkJS();
@@ -850,7 +803,6 @@ export async function proveTransfer(
   const tSignals0 = Date.now();
   const signals = toWitnessSignalsTransfer(inputs);
   const tSignals1 = Date.now();
-  console.log(`⏱️ build-signals(ms): ${tSignals1 - tSignals0}`);
   const { groth16 } = snarkjs;
   const tWitness0 = Date.now();
   let proof: any;
@@ -870,12 +822,6 @@ export async function proveTransfer(
       encoding: "utf8",
     });
     if (which.status !== 0 || !which.stdout) {
-      console.error(
-        `rapidsnark binary not found: ${bin}. Set RAPIDSNARK_BIN or install rapidsnark.`,
-      );
-      console.error(
-        "macOS hint: brew tap geometryxyz/snark && brew install rapidsnark (or build from source)",
-      );
       throw new Error("rapidsnark not available on PATH");
     }
     const rs = require("child_process").spawnSync(
@@ -900,9 +846,6 @@ export async function proveTransfer(
     publicSignals = out.publicSignals;
   }
   const tWitness1 = Date.now();
-  console.log(
-    `⏱️ witness+prove(ms): ${tWitness1 - tWitness0} (rapidsnark=${useRapidsnark})`,
-  );
 
   // Format proof for Solana (256 bytes total)
   const proofBytes = new Uint8Array(256);
@@ -974,7 +917,7 @@ export async function proveTransfer(
   });
 
   const t1 = Date.now();
-  console.log(`⏱️ transfer total(ms): ${t1 - t0}`);
+  log.info("proveTransfer: completed", { elapsedMs: t1 - t0 });
   return { proof: formatted, publicInputs };
 }
 
@@ -1071,17 +1014,23 @@ export async function proveRenew(
   inputs: RenewInputs,
   options?: ProverOptions,
 ): Promise<ProverOutput> {
+  // Validate circuit inputs fit within BN254 scalar field
+  assertInField(inputs.oldNote.value, "renew oldNote.value");
+  assertBytesInField(inputs.oldNote.randomness, "renew oldNote.randomness");
+  assertBytesInField(inputs.oldNote.owner, "renew oldNote.owner");
+  assertInField(inputs.newNote.value, "renew newNote.value");
+  assertBytesInField(inputs.newNote.randomness, "renew newNote.randomness");
+  assertBytesInField(inputs.newNote.owner, "renew newNote.owner");
+
+  const log = getLogger();
   const debugTrace = process.env.ZK_TRACE_PROVER === "1";
   const t0 = Date.now();
+  log.info("proveRenew: starting", {
+    oldEpoch: inputs.oldEpoch.toString(),
+    newEpoch: inputs.newEpoch.toString(),
+  });
 
   if (debugTrace) {
-    console.log("[trace] renew inputs", {
-      oldRoot: Buffer.from(inputs.merkleRoot).toString("hex").slice(0, 16),
-      oldEpoch: inputs.oldEpoch.toString(),
-      newEpoch: inputs.newEpoch.toString(),
-      leafIndex: inputs.oldLeafIndex,
-      value: inputs.oldNote.value.toString(),
-    });
   }
 
   const txAnchorBytes = inputs.txAnchor ?? new Uint8Array(32);
@@ -1132,7 +1081,6 @@ export async function proveRenew(
       Array.from(chainIdBytes),
     ];
 
-    console.log("⚑ MOCK_PROOFS enabled: skipping witness+proving for renew");
     return { proof: empty, publicInputs };
   }
 
@@ -1144,7 +1092,6 @@ export async function proveRenew(
   const tSignals0 = Date.now();
   const signals = toWitnessSignalsRenew(inputs, options);
   const tSignals1 = Date.now();
-  console.log(`⏱️ renew build-signals(ms): ${tSignals1 - tSignals0}`);
 
   const tProve0 = Date.now();
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(
@@ -1153,7 +1100,6 @@ export async function proveRenew(
     artifacts.zkeyPath,
   );
   const tProve1 = Date.now();
-  console.log(`⏱️ renew prove(ms): ${tProve1 - tProve0}`);
 
   // Convert proof to bytes format
   const proofBytes = new Uint8Array(256);
@@ -1202,6 +1148,6 @@ export async function proveRenew(
   });
 
   const t1 = Date.now();
-  console.log(`⏱️ renew total(ms): ${t1 - t0}`);
+  log.info("proveRenew: completed", { elapsedMs: t1 - t0 });
   return { proof: formatted, publicInputs };
 }

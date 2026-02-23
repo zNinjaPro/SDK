@@ -40,6 +40,8 @@ function dummyInputs(): WithdrawInputs {
     merkleRoot: new Uint8Array(Buffer.alloc(32, 9)),
     recipient,
     amount: 250n,
+    epoch: 1n,
+    leafIndex,
   };
 }
 
@@ -53,10 +55,10 @@ describe("Prover merkle order selection", () => {
     const firstHex = path[0] as any;
     const lastHex = path[path.length - 1] as any;
     expect(firstHex).to.equal(
-      BigInt("0x" + Buffer.alloc(32, 1).toString("hex")).toString()
+      BigInt("0x" + Buffer.alloc(32, 1).toString("hex")).toString(),
     );
     expect(lastHex).to.equal(
-      BigInt("0x" + Buffer.alloc(32, 4).toString("hex")).toString()
+      BigInt("0x" + Buffer.alloc(32, 4).toString("hex")).toString(),
     );
   });
 
@@ -71,10 +73,10 @@ describe("Prover merkle order selection", () => {
     const firstHex = path[0] as any;
     const lastHex = path[path.length - 1] as any;
     expect(firstHex).to.equal(
-      BigInt("0x" + Buffer.alloc(32, 4).toString("hex")).toString()
+      BigInt("0x" + Buffer.alloc(32, 4).toString("hex")).toString(),
     );
     expect(lastHex).to.equal(
-      BigInt("0x" + Buffer.alloc(32, 1).toString("hex")).toString()
+      BigInt("0x" + Buffer.alloc(32, 1).toString("hex")).toString(),
     );
   });
 });

@@ -12,6 +12,7 @@
     "test:unit": "mocha -r ts-node/register tests/unit.test.ts tests/burn.test.ts --exit",
     "test:e2e": "mocha -r ts-node/register tests/e2e.test.ts --timeout 120000 --exit",
     "test:e2e:fast": "mocha -r ts-node/register tests/e2e_fast.test.ts --timeout 120000 --exit",
+    "test:devnet": "mocha -r ts-node/register tests/devnet-smoke.test.ts --timeout 600000 --exit",
     "e2e:validator": "./scripts/start-validator.sh --quiet",
     "e2e:validator:stop": "./scripts/stop-validator.sh",
     "e2e:demo": "node test-simple.js",

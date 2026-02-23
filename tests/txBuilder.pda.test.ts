@@ -13,68 +13,72 @@ const stubPoolConfig = new PublicKey("11111111111111111111111111111111");
 const stubConnection: any = {};
 
 describe("PDA derivation", () => {
-  it("deriveLeafChunk requires mint and matches seeds", () => {
+  it("deriveEpochTree matches expected seeds", () => {
     const builder = new TransactionBuilder(
       stubProgram,
       stubPoolConfig,
-      stubConnection
+      stubConnection,
     );
-    const mint = new PublicKey("So11111111111111111111111111111111111111112");
-    const leafIndex = 512; // chunkIndex = 2
-    const [pda, bump] = (builder as any).deriveLeafChunk(leafIndex, mint);
+    const epoch = 1n;
+    const epochBytes = Buffer.alloc(8);
+    epochBytes.writeBigUInt64LE(epoch);
+    const [pda, bump] = (builder as any).deriveEpochTree(epoch);
     const expected = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from("leaf"),
-        mint.toBuffer(),
-        new BN(2).toArrayLike(Buffer, "be", 4),
-      ],
-      stubProgram.programId
+      [Buffer.from("epoch_tree"), stubPoolConfig.toBuffer(), epochBytes],
+      stubProgram.programId,
     );
     expect(pda.toBase58()).to.equal(expected[0].toBase58());
     expect(bump).to.equal(expected[1]);
   });
 
-  it("deriveNullifierChunk uses first 4 bytes BE for index", () => {
+  it("deriveEpochLeafChunk computes correct chunk index", () => {
     const builder = new TransactionBuilder(
       stubProgram,
       stubPoolConfig,
-      stubConnection
+      stubConnection,
     );
+    const epoch = 2n;
+    const leafIndex = 512; // chunkIndex = 512 / 256 = 2
+    const [pda] = (builder as any).deriveEpochLeafChunk(epoch, leafIndex);
+    const epochBytes = Buffer.alloc(8);
+    epochBytes.writeBigUInt64LE(epoch);
+    const expected = PublicKey.findProgramAddressSync(
+      [
+        Buffer.from("leaves"),
+        stubPoolConfig.toBuffer(),
+        epochBytes,
+        new BN(2).toArrayLike(Buffer, "le", 4),
+      ],
+      stubProgram.programId,
+    );
+    expect(pda.toBase58()).to.equal(expected[0].toBase58());
+  });
+
+  it("deriveNullifierMarker uses epoch and nullifier seeds", () => {
+    const builder = new TransactionBuilder(
+      stubProgram,
+      stubPoolConfig,
+      stubConnection,
+    );
+    const epoch = 3n;
     const nullifier = new Uint8Array(32);
-    // Set first 4 bytes to 0x00000005 => chunkIndex = 5
     nullifier.set([0x00, 0x00, 0x00, 0x05], 0);
-    const { address, bump, index } = (builder as any).deriveNullifierChunk(
+    const [pda, bump] = (builder as any).deriveNullifierMarker(
+      epoch,
       nullifier,
-      256
     );
+    const epochBytes = Buffer.alloc(8);
+    epochBytes.writeBigUInt64LE(epoch);
     const expected = PublicKey.findProgramAddressSync(
       [
         Buffer.from("nullifier"),
         stubPoolConfig.toBuffer(),
-        new BN(5).toArrayLike(Buffer, "be", 4),
+        epochBytes,
+        Buffer.from(nullifier),
       ],
-      stubProgram.programId
+      stubProgram.programId,
     );
-    expect(address.toBase58()).to.equal(expected[0].toBase58());
+    expect(pda.toBase58()).to.equal(expected[0].toBase58());
     expect(bump).to.equal(expected[1]);
-    expect(index).to.equal(5);
-  });
-
-  it("deriveNullifierChunk modulo distributes across chunk space", () => {
-    const builder = new TransactionBuilder(
-      stubProgram,
-      stubPoolConfig,
-      stubConnection
-    );
-    const nullifier = new Uint8Array(32);
-    nullifier.set([0xff, 0xff, 0xff, 0xff], 0);
-    const chunkSize = 1024;
-    const maxChunks = Math.floor(0xffffffff / chunkSize);
-    const expectedIndex = 0xffffffff % maxChunks;
-    const { index } = (builder as any).deriveNullifierChunk(
-      nullifier,
-      chunkSize
-    );
-    expect(index).to.equal(expectedIndex);
   });
 });

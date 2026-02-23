@@ -165,22 +165,26 @@ export class TransactionBuilder {
     }
 
     const ix = await (this.program.methods as any)
-      .garbageCollect(new BN(epoch.toString()))
+      .gcEpochTree(new BN(epoch.toString()))
       .accounts({
         poolConfig: this.poolConfigPda,
         epochTree,
-        beneficiary: caller,
-        caller,
-        systemProgram: SystemProgram.programId,
+        collector: caller,
       })
-      .remainingAccounts(
-        leafChunks.map((chunk) => ({
-          pubkey: chunk.pubkey,
-          isWritable: true,
-          isSigner: false,
-        })),
-      )
       .instruction();
+
+    // GC leaf chunks via separate instructions
+    for (const chunkInfo of leafChunks) {
+      const leafIx = await (this.program.methods as any)
+        .gcLeafChunk(new BN(epoch.toString()), chunkInfo.chunkIndex)
+        .accounts({
+          poolConfig: this.poolConfigPda,
+          leafChunk: chunkInfo.pubkey,
+          collector: caller,
+        })
+        .instruction();
+      tx.add(leafIx);
+    }
 
     tx.add(ix);
 
@@ -373,9 +377,6 @@ export class TransactionBuilder {
     );
 
     // Generate proof
-    console.log("📍 Generating withdraw proof...");
-    console.log(`   Note epoch: ${epoch}, leafIndex: ${leafIndex}`);
-    console.log(`   Note value: ${inputNote.value.toString()}`);
 
     const artifacts = proverArtifacts || PROVER_ARTIFACTS.withdraw;
     const { proof, publicInputs } = await proveWithdraw(
@@ -394,7 +395,6 @@ export class TransactionBuilder {
       proverOptions,
     );
 
-    console.log("✅ Proof generated successfully");
 
     const proofBytes = Buffer.concat([
       Buffer.from(proof.a),
@@ -558,7 +558,6 @@ export class TransactionBuilder {
     const encrypted2 = encryptNote(serialized2, outputTuple[1].owner);
 
     // Generate proof
-    console.log("📍 Generating transfer proof...");
     const merkleProofTuple: [MerkleProof, MerkleProof] = [proof1, proof2];
     const merkleRoot = inputTree1.getRoot();
 
@@ -579,7 +578,6 @@ export class TransactionBuilder {
       proverOptions,
     );
 
-    console.log("✅ Transfer proof generated");
 
     const proofBytes = Buffer.concat([
       Buffer.from(proof.a),
@@ -757,8 +755,6 @@ export class TransactionBuilder {
     const encrypted = encryptNote(serialized, newNote.owner);
 
     // Generate proof
-    console.log("📍 Generating renew proof...");
-    console.log(`   Migrating from epoch ${oldEpoch} to ${currentEpoch}`);
 
     const artifacts = proverArtifacts || PROVER_ARTIFACTS.renew;
     const { proof, publicInputs } = await proveRenew(
@@ -777,7 +773,6 @@ export class TransactionBuilder {
       proverOptions,
     );
 
-    console.log("✅ Renew proof generated");
 
     const proofBytes = Buffer.concat([
       Buffer.from(proof.a),
@@ -862,8 +857,12 @@ export class TransactionBuilder {
    */
   private async findEpochLeafChunks(
     epoch: bigint,
-  ): Promise<{ pubkey: PublicKey; lamports: number }[]> {
-    const results: { pubkey: PublicKey; lamports: number }[] = [];
+  ): Promise<{ pubkey: PublicKey; lamports: number; chunkIndex: number }[]> {
+    const results: {
+      pubkey: PublicKey;
+      lamports: number;
+      chunkIndex: number;
+    }[] = [];
     const epochBytes = this.epochToBytes(epoch);
 
     // Search for leaf chunk accounts with the epoch prefix
@@ -882,7 +881,11 @@ export class TransactionBuilder {
 
       const info = await this.connection.getAccountInfo(leafChunk);
       if (info) {
-        results.push({ pubkey: leafChunk, lamports: info.lamports });
+        results.push({
+          pubkey: leafChunk,
+          lamports: info.lamports,
+          chunkIndex: i,
+        });
       } else {
         break; // Assume contiguous chunk indices
       }

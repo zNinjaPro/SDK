@@ -354,9 +354,6 @@ export interface ClientOptions {
   /** Enable debug logging */
   debug?: boolean;
 
-  /** Cache directory for storing tree/notes */
-  cacheDir?: string;
-
   /** Slots before expiry to warn about note renewal */
   renewalWarningSlots?: bigint;
 }

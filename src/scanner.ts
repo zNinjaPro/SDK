@@ -14,7 +14,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { Program } from "@coral-xyz/anchor";
 import { NoteManager } from "./noteManager";
 import { Note, EpochState } from "./types";
-import { decryptNote } from "./crypto";
+import { decryptNote, deserializeNote } from "./crypto";
 import crypto from "crypto";
 
 /**
@@ -31,11 +31,28 @@ export class UTXOScanner {
   private viewingKey?: Uint8Array;
   private noteManager?: NoteManager;
   private epochCallbacks: EpochCallback[] = [];
+  private historyScanLimit: number;
 
-  constructor(connection: Connection, program: Program, poolConfig: PublicKey) {
+  constructor(
+    connection: Connection,
+    program: Program,
+    poolConfig: PublicKey,
+    options?: { historyScanLimit?: number },
+  ) {
     this.connection = connection;
     this.program = program;
     this.poolConfig = poolConfig;
+    this.historyScanLimit = options?.historyScanLimit ?? 100;
+  }
+
+  /** Get the current history scan limit */
+  getHistoryScanLimit(): number {
+    return this.historyScanLimit;
+  }
+
+  /** Set the history scan limit */
+  setHistoryScanLimit(limit: number): void {
+    this.historyScanLimit = limit;
   }
 
   /** Register a callback for epoch state changes */
@@ -54,9 +71,7 @@ export class UTXOScanner {
       if (tx && tx.meta && tx.meta.logMessages) {
         await this.processTxLogs(tx.meta.logMessages);
       }
-    } catch (e) {
-      console.warn("[Scanner] Rescan failed for", signature, e);
-    }
+    } catch (e) {}
   }
 
   // Anchor event discriminators: sha256("event:Name").slice(0,8)
@@ -131,9 +146,7 @@ export class UTXOScanner {
     );
 
     // Scan historical events in background (don't await)
-    this.scanHistory().catch((error) => {
-      console.error("Error scanning history:", error);
-    });
+    this.scanHistory().catch((error) => {});
   }
 
   /**
@@ -150,13 +163,14 @@ export class UTXOScanner {
   }
 
   /**
-   * Scan historical events to catch up
+   * Scan historical events to catch up.
+   * Can be called externally for wallet recovery.
    */
-  private async scanHistory(): Promise<void> {
+  async scanHistory(): Promise<void> {
     // Get recent transactions for this pool
     const signatures = await this.connection.getSignaturesForAddress(
       this.poolConfig,
-      { limit: 100 },
+      { limit: this.historyScanLimit },
     );
 
     for (const sig of signatures) {
@@ -169,9 +183,7 @@ export class UTXOScanner {
         if (tx && tx.meta) {
           await this.processTxLogs(tx.meta.logMessages || []);
         }
-      } catch (error) {
-        console.error(`Error processing transaction ${sig.signature}:`, error);
-      }
+      } catch (error) {}
     }
   }
 
@@ -255,14 +267,9 @@ export class UTXOScanner {
     if (data.length < minimum) return;
     const cmOffset = 8 + 1 + 32 + 32;
     const commitment = data.subarray(cmOffset, cmOffset + 32);
-    console.log(
-      "🔍 Scanner: Extracted commitment from event, length:",
-      commitment.length,
-    );
     const leafIndexOffset = cmOffset + 32;
     const leafIndexLE = data.subarray(leafIndexOffset, leafIndexOffset + 8);
     const leafIndex = Number(leafIndexLE.readBigUInt64LE());
-    console.log("🔍 Scanner: leafIndex =", leafIndex);
     const encLenOffset = leafIndexOffset + 8 + 32 + 32 + 16; // skip new_root + tx_anchor + tag
     if (data.length < encLenOffset + 4) return;
     const encLen = data.readUInt32LE(encLenOffset);
@@ -272,31 +279,20 @@ export class UTXOScanner {
     const encryptedNote = data.subarray(encStart, encEnd);
 
     // Promote pending note matching commitment
-    const pending = (this.noteManager as any).pendingNotes as
-      | Note[]
-      | undefined;
-    if (pending) {
-      console.log("🔍 Scanner: Found", pending.length, "pending notes");
+    const pending = this.noteManager ? this.noteManager.getPendingNotes() : [];
+    if (pending.length > 0) {
       if (pending.length > 0) {
-        console.log(
-          "   Pending[0] commitment length:",
-          pending[0].commitment.length,
-        );
       }
       const idx = pending.findIndex((n) =>
         arraysEqual(n.commitment, commitment),
       );
       if (idx !== -1) {
-        console.log("✅ Scanner: Found matching pending note at index", idx);
         const note = pending[idx];
         note.leafIndex = leafIndex;
         this.noteManager.addNote(note);
         return;
       }
       // No matching pending note; leave pending untouched to avoid corrupting leafIndex/commitment mapping
-      console.log(
-        "⚠️ Scanner: No matching commitment; leaving pending notes unchanged",
-      );
       return;
     }
 
@@ -367,16 +363,14 @@ export class UTXOScanner {
         if (end > data.length) break;
         commitments.push(new Uint8Array(data.subarray(start, end)));
       }
-      const pending = (this.noteManager as any).pendingNotes as
-        | Note[]
-        | undefined;
-      if (pending) {
-        for (const cm of commitments) {
-          const idx = pending.findIndex((n) => arraysEqual(n.commitment, cm));
-          if (idx !== -1) {
-            const note = pending[idx];
-            this.noteManager!.addNote(note);
-          }
+      const pending = this.noteManager
+        ? this.noteManager.getPendingNotes()
+        : [];
+      for (const cm of commitments) {
+        const idx = pending.findIndex((n) => arraysEqual(n.commitment, cm));
+        if (idx !== -1) {
+          const note = pending[idx];
+          this.noteManager!.addNote(note);
         }
       }
     } catch (error) {
@@ -425,20 +419,13 @@ export class UTXOScanner {
     if (data.length < cursor + encLen) return;
     const encryptedNote = data.subarray(cursor, cursor + encLen);
 
-    console.log(
-      `🔍 Scanner: V2 Deposit - epoch=${epoch}, leafIndex=${leafIndex}`,
-    );
-
     // Promote pending note matching commitment
-    const pending = (this.noteManager as any).pendingNotes as
-      | Note[]
-      | undefined;
-    if (pending) {
+    const pending = this.noteManager ? this.noteManager.getPendingNotes() : [];
+    if (pending.length > 0) {
       const idx = pending.findIndex((n) =>
         arraysEqual(n.commitment, commitment),
       );
       if (idx !== -1) {
-        console.log("✅ Scanner: Found matching pending note");
         const note = pending[idx];
         note.epoch = epoch;
         note.leafIndex = leafIndex;
@@ -479,7 +466,6 @@ export class UTXOScanner {
     // Extract nullifier
     const nullifier = data.subarray(cursor, cursor + 32);
 
-    console.log(`🔍 Scanner: V2 Withdraw - epoch=${epoch}`);
     this.noteManager.markSpentByNullifier(nullifier, epoch);
   }
 
@@ -556,24 +542,16 @@ export class UTXOScanner {
       cursor += 8;
     }
 
-    console.log(
-      `🔍 Scanner: V2 Transfer - outputEpoch=${outputEpoch}, outputs=${cmLen}`,
-    );
-
     // Promote pending notes
-    const pending = (this.noteManager as any).pendingNotes as
-      | Note[]
-      | undefined;
-    if (pending) {
-      for (let i = 0; i < commitments.length; i++) {
-        const cm = commitments[i];
-        const idx = pending.findIndex((n) => arraysEqual(n.commitment, cm));
-        if (idx !== -1) {
-          const note = pending[idx];
-          note.epoch = outputEpoch;
-          note.leafIndex = i < leafIndices.length ? leafIndices[i] : 0;
-          this.noteManager.addNote(note);
-        }
+    const pending = this.noteManager ? this.noteManager.getPendingNotes() : [];
+    for (let i = 0; i < commitments.length; i++) {
+      const cm = commitments[i];
+      const idx = pending.findIndex((n) => arraysEqual(n.commitment, cm));
+      if (idx !== -1) {
+        const note = pending[idx];
+        note.epoch = outputEpoch;
+        note.leafIndex = i < leafIndices.length ? leafIndices[i] : 0;
+        this.noteManager.addNote(note);
       }
     }
   }
@@ -611,18 +589,12 @@ export class UTXOScanner {
     // Extract new leaf index
     const newLeafIndex = Number(data.readBigUInt64LE(cursor));
 
-    console.log(
-      `🔍 Scanner: Renew - epoch ${oldEpoch} -> ${newEpoch}, leafIndex=${newLeafIndex}`,
-    );
-
     // Mark old note as spent
     this.noteManager.markSpentByNullifier(oldNullifier, oldEpoch);
 
     // Promote pending new note
-    const pending = (this.noteManager as any).pendingNotes as
-      | Note[]
-      | undefined;
-    if (pending) {
+    const pending = this.noteManager ? this.noteManager.getPendingNotes() : [];
+    if (pending.length > 0) {
       const idx = pending.findIndex((n) =>
         arraysEqual(n.commitment, newCommitment),
       );
@@ -648,16 +620,12 @@ export class UTXOScanner {
     cursor += 8;
     const newEpoch = data.readBigUInt64LE(cursor);
 
-    console.log(`🔍 Scanner: Epoch rollover - ${oldEpoch} -> ${newEpoch}`);
-
     // Notify callbacks
     for (const cb of this.epochCallbacks) {
       try {
         cb(oldEpoch, EpochState.Frozen);
         cb(newEpoch, EpochState.Active);
-      } catch (e) {
-        console.warn("Epoch callback error:", e);
-      }
+      } catch (e) {}
     }
   }
 
@@ -672,15 +640,11 @@ export class UTXOScanner {
     let cursor = 8;
     const epoch = data.readBigUInt64LE(cursor);
 
-    console.log(`🔍 Scanner: Epoch finalized - ${epoch}`);
-
     // Notify callbacks
     for (const cb of this.epochCallbacks) {
       try {
         cb(epoch, EpochState.Finalized);
-      } catch (e) {
-        console.warn("Epoch callback error:", e);
-      }
+      } catch (e) {}
     }
   }
 
@@ -699,14 +663,19 @@ export class UTXOScanner {
       const decrypted = decryptNote(encrypted, nonce, this.viewingKey);
       if (!decrypted) return null;
 
-      const note = { commitment: Array.from(commitment) } as any; // Simplified for scanning
-
-      // Verify commitment matches
-      // (simplified - in production should recompute commitment)
+      // Parse the decrypted note data: value(32) || token(32) || owner(32) || blinding(32) || memo_len(2) || memo
+      const { value, token, owner, blinding, memo } =
+        deserializeNote(decrypted);
 
       return {
-        ...note,
-        commitment: Array.from(commitment),
+        value,
+        token: new PublicKey(token),
+        owner,
+        blinding,
+        memo,
+        commitment: new Uint8Array(commitment),
+        nullifier: new Uint8Array(32), // Computed later when epoch/leafIndex are known
+        randomness: blinding, // Blinding is the randomness
       };
     } catch (error) {
       // Decryption failed - not our note

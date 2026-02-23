@@ -32,7 +32,7 @@ describe("crypto commitments", () => {
     const changedOwner = await computeCommitment(
       value,
       randomBytes(32),
-      randomness
+      randomness,
     );
     const changedRand = await computeCommitment(value, owner, randomBytes(32));
 
@@ -44,9 +44,21 @@ describe("crypto commitments", () => {
   it("computeNullifier returns 32 bytes and is deterministic", async () => {
     const commitment = randomBytes(32);
     const nullifierKey = randomBytes(32);
+    const epoch = 1n;
+    const leafIndex = 0;
 
-    const n1 = await computeNullifier(commitment, nullifierKey);
-    const n2 = await computeNullifier(commitment, nullifierKey);
+    const n1 = await computeNullifier(
+      commitment,
+      nullifierKey,
+      epoch,
+      leafIndex,
+    );
+    const n2 = await computeNullifier(
+      commitment,
+      nullifierKey,
+      epoch,
+      leafIndex,
+    );
 
     expect(n1).to.be.instanceOf(Uint8Array);
     expect(n1.length).to.equal(32);
@@ -56,13 +68,30 @@ describe("crypto commitments", () => {
   it("computeNullifier changes with inputs", async () => {
     const commitment = randomBytes(32);
     const nullifierKey = randomBytes(32);
+    const epoch = 1n;
+    const leafIndex = 0;
 
-    const base = await computeNullifier(commitment, nullifierKey);
-    const changedCommit = await computeNullifier(randomBytes(32), nullifierKey);
-    const changedKey = await computeNullifier(commitment, randomBytes(32));
+    const base = await computeNullifier(
+      commitment,
+      nullifierKey,
+      epoch,
+      leafIndex,
+    );
+    const changedCommit = await computeNullifier(
+      randomBytes(32),
+      nullifierKey,
+      epoch,
+      leafIndex,
+    );
+    const changedKey = await computeNullifier(
+      commitment,
+      randomBytes(32),
+      epoch,
+      leafIndex,
+    );
 
     expect(Buffer.from(base).equals(Buffer.from(changedCommit))).to.equal(
-      false
+      false,
     );
     expect(Buffer.from(base).equals(Buffer.from(changedKey))).to.equal(false);
   });

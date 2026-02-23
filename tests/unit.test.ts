@@ -20,7 +20,7 @@ describe("SDK Unit Tests", () => {
       const addr1 = km1.getShieldedAddress();
       const addr2 = km2.getShieldedAddress();
       expect(Buffer.from(addr1).toString("hex")).to.not.equal(
-        Buffer.from(addr2).toString("hex")
+        Buffer.from(addr2).toString("hex"),
       );
     });
 
@@ -34,7 +34,7 @@ describe("SDK Unit Tests", () => {
       const addr2 = km2.getShieldedAddress();
 
       expect(Buffer.from(addr1).toString("hex")).to.equal(
-        Buffer.from(addr2).toString("hex")
+        Buffer.from(addr2).toString("hex"),
       );
     });
 
@@ -161,7 +161,7 @@ describe("SDK Unit Tests", () => {
 
       // Should be different
       expect(Buffer.from(bytes1).toString("hex")).to.not.equal(
-        Buffer.from(bytes2).toString("hex")
+        Buffer.from(bytes2).toString("hex"),
       );
     });
 
@@ -173,7 +173,7 @@ describe("SDK Unit Tests", () => {
       const hash2 = sha256(data);
 
       expect(Buffer.from(hash1).toString("hex")).to.equal(
-        Buffer.from(hash2).toString("hex")
+        Buffer.from(hash2).toString("hex"),
       );
     });
 
@@ -196,7 +196,7 @@ describe("SDK Unit Tests", () => {
       const commitment = new Uint8Array(32).fill(1);
       const nullifierKey = new Uint8Array(32).fill(2);
 
-      const nullifier = await computeNullifier(commitment, nullifierKey);
+      const nullifier = await computeNullifier(commitment, nullifierKey, 1n, 0);
 
       expect(nullifier).to.be.instanceOf(Uint8Array);
       expect(nullifier.length).to.equal(32);
